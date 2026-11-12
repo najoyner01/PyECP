@@ -152,14 +152,15 @@ def _hcore_energy(hessobj, dm0, dme0):
 
     de_hcore = _hess_nuc_without_ecp(mol, dm0)
     with_ecp = len(mol._ecpbas) > 0
-    if with_ecp:
-        de_hcore += hess_nuc_elec_ecp(mol, dm0).transpose(2,3,0,1) * 2.
-
     h1aa = cp.asarray(mol.intor('int1e_ipipkin', comp=9))
     h1ab = cp.asarray(mol.intor('int1e_ipkinip', comp=9))
     if with_ecp:
-        h1aa += get_ecp_ipip_sum(mol, 'ipipv')
-        h1ab += get_ecp_ipip_sum(mol, 'ipvip')
+        # One pass over the ECP 2nd-derivative kernels gives both the
+        # (nuc, elec) cross terms and the atom-summed <i''|U|j>, <i'|U|j'>.
+        de_ecp, h1aa_ecp, h1ab_ecp = hess_nuc_elec_ecp(mol, dm0, return_h1_diag=True)
+        de_hcore += de_ecp.transpose(2,3,0,1) * 2.
+        h1aa += h1aa_ecp
+        h1ab += h1ab_ecp
     nao = h1ab.shape[1]
     h1aa = contract('xypq,qp->pxy', h1aa.reshape(3, 3, nao, nao), dm0)
     h1ab = contract('xypq,qp->pqxy', h1ab.reshape(3, 3, nao, nao), dm0)
@@ -757,17 +758,29 @@ def gen_vind(hessobj, mo_coeff, mo_occ):
         return hessobj.get_veff_resp_mo(mol, dm1, mo_coeff, mo_occ, hermi=1)
     return fx
 
-def hess_nuc_elec_ecp(mol, dm):
+def hess_nuc_elec_ecp(mol, dm, return_h1_diag=False):
     '''
     Calculate hessian contribution due to (nuc, elec) pair with ECP
+
+    Kwargs:
+        return_h1_diag: also return ``sum_atoms <i''|U|j>`` (``ipipv``) and
+            ``sum_atoms <i'|U|j'>`` (``ipvip``) as ``[9, nao, nao]``,
+            accumulated from the same kernel pass, so callers do not have to
+            re-run ``get_ecp_ipip_sum``.
     '''
     nao = mol.nao
     natm = mol.natm
     aoslices = mol.aoslice_by_atom()
     ecp_atoms = sorted(set(int(a) for a in mol._ecpbas[:,ATOM_OF]))
     de_ecp = cupy.zeros([3,3,natm,natm])
+    h1aa = h1ab = None
+    if return_h1_diag:
+        h1aa = cupy.zeros([9, nao, nao])
+        h1ab = cupy.zeros([9, nao, nao])
 
     for batch, mat in loop_ecp_ipip(mol, ip_type='ipipv', ecp_atoms=ecp_atoms):
+        if return_h1_diag:
+            h1aa += mat.sum(axis=0)
         rinv2aa = -mat.reshape(len(batch),3,3,nao,nao)
         for bidx, atm_id in enumerate(batch):
             de = contract('xypq,pq->xyp', rinv2aa[bidx], dm)
@@ -780,6 +793,8 @@ def hess_nuc_elec_ecp(mol, dm):
             de_ecp[:,:,atm_id,atm_id] -= de
 
     for batch, mat in loop_ecp_ipip(mol, ip_type='ipvip', ecp_atoms=ecp_atoms):
+        if return_h1_diag:
+            h1ab += mat.sum(axis=0)
         rinv2ab = -mat.reshape(len(batch),3,3,nao,nao)
         for bidx, atm_id in enumerate(batch):
             de = contract('xypq,pq->xyp', rinv2ab[bidx], dm).transpose(1,0,2)
@@ -791,6 +806,8 @@ def hess_nuc_elec_ecp(mol, dm):
             de = contract('xypq,pq->xy', rinv2ab[bidx], dm)
             de_ecp[:,:,atm_id,atm_id] -= de
 
+    if return_h1_diag:
+        return de_ecp, h1aa, h1ab
     return de_ecp
 
 def kernel(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):

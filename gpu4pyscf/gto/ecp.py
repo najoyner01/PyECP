@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import OrderedDict
 import ctypes
 import numpy as np
 import cupy as cp
@@ -64,18 +65,95 @@ def _ecp_expcutoff(mol):
     '''Screening cutoff on the exponential argument.  Never looser than the
     pyscf default (EXPCUTOFF); tightened further when mol.precision is tighter.
     '''
-    prec = getattr(mol, 'precision', 1e-13)
+    # Look only at the instance dict: Mole has no `precision`, and falling
+    # through to Mole.__getattr__ triggers a lazy `import pyscf.__all__`
+    # (seconds on a network filesystem) inside the first get_ecp call.
+    # pbc.gto.Cell sets self.precision in __init__, so it is still honoured.
+    prec = vars(mol).get('precision', 1e-13)
     if not prec or prec <= 0:
         prec = 1e-13
     return max(EXPCUTOFF, -float(np.log(prec)))
 
 
-def _build_screen_data(_sorted_mol, ecpbas, ecp_loc):
-    '''Per-shell and per-ECP-group data needed by _screen_grid.
+class _ScreenData(tuple):
+    '''Tuple subclass `(bas_min_exp, bas_coords, ecp_min_exp, ecp_coords)`
+    that also carries precomputed distance and Level-1 screening tables for
+    vectorized 2-level screening in `_screen_block`.
+    '''
+    # NOTE: tuple subclasses cannot declare non-empty __slots__; the extra
+    # attributes live in the instance __dict__.
+
+    def __new__(cls, bas_min_exp, bas_coords, ecp_min_exp, ecp_coords,
+                rrca=None, rrab=None, l1_lhs=None, l1_rhs_fac=None):
+        obj = super().__new__(
+            cls, (bas_min_exp, bas_coords, ecp_min_exp, ecp_coords))
+        obj.rrca = rrca
+        obj.rrab = rrab
+        obj.l1_lhs = l1_lhs
+        obj.l1_rhs_fac = l1_rhs_fac
+        return obj
+
+
+def _collapse_l_groups(uniq_l_ctr, l_ctr_counts):
+    '''Collapse (l, nprim) groups from group_basis() by unique angular
+    momentum l. Since group_basis() sorts shells by l ascending (and nprim
+    descending within each l), shells sharing the same l already occupy a
+    single contiguous shell index range.
+    '''
+    if len(uniq_l_ctr) == 0:
+        return uniq_l_ctr, l_ctr_counts
+    ls = uniq_l_ctr[:, 0]
+    uniq_l, first_idx = np.unique(ls, return_index=True)
+    if len(uniq_l) == len(uniq_l_ctr):
+        return uniq_l_ctr, l_ctr_counts
+    collapsed_counts = np.add.reduceat(l_ctr_counts, first_idx)
+    collapsed_uniq = uniq_l_ctr[first_idx].copy()
+    return collapsed_uniq, collapsed_counts
+
+
+def _compute_bas_min_exp(bas, env):
+    nbas = len(bas)
+    if nbas == 0:
+        return np.empty(0, dtype=np.float64)
+    ptr = bas[:, gto.PTR_EXP]
+    nprim = bas[:, gto.NPRIM_OF]
+    if np.all(nprim == 1):
+        return env[ptr].astype(np.float64, copy=True)
+    bas_min_exp = np.empty(nbas, dtype=np.float64)
+    one_mask = nprim == 1
+    bas_min_exp[one_mask] = env[ptr[one_mask]]
+    for sh in np.flatnonzero(~one_mask):
+        n = int(nprim[sh])
+        p = int(ptr[sh])
+        bas_min_exp[sh] = env[p:p+n].min() if n > 0 else np.inf
+    return bas_min_exp
+
+
+def _compute_ecp_min_exp(ecpbas, ecp_loc, env):
+    ngrp = len(ecp_loc) - 1
+    if ngrp <= 0 or len(ecpbas) == 0:
+        return np.zeros(max(ngrp, 0), dtype=np.float64)
+    ptr = ecpbas[:, gto.PTR_EXP]
+    nprim = ecpbas[:, gto.NPRIM_OF]
+    if np.all(nprim == 1):
+        row_min = env[ptr]
+    else:
+        row_min = np.array(
+            [env[p:p+n].min() if n > 0 else np.inf
+             for p, n in zip(ptr, nprim)],
+            dtype=np.float64)
+    ecp_min_exp = np.minimum.reduceat(row_min, ecp_loc[:-1])
+    ecp_min_exp[~np.isfinite(ecp_min_exp)] = 0.0
+    return ecp_min_exp
+
+
+def _build_screen_data(_sorted_mol, ecpbas, ecp_loc,
+                       bas_min_exp=None, ecp_min_exp=None):
+    '''Per-shell and per-ECP-group data needed by _screen_grid and _screen_block.
 
     Returns
-        (bas_min_exp[nbas], bas_coords[nbas,3],
-         ecp_min_exp[ngrp], ecp_coords[ngrp,3])
+        _ScreenData((bas_min_exp[nbas], bas_coords[nbas,3],
+                     ecp_min_exp[ngrp], ecp_coords[ngrp,3]))
     where a group is one (l, atom) block delimited by ecp_loc, matching the
     third column (ksh) of the task grids.  All exponents are the smallest
     primitive exponent (slowest decay = most conservative bound).
@@ -84,26 +162,38 @@ def _build_screen_data(_sorted_mol, ecpbas, ecp_loc):
     env = _sorted_mol._env
     atom_coords = _sorted_mol.atom_coords()  # Bohr
 
-    ptr = bas[:, gto.PTR_EXP]
-    nprim = bas[:, gto.NPRIM_OF]
-    # np.inf for a zero-primitive padding shell -> screened out (its
-    # contraction coefficients are zero anyway).
-    bas_min_exp = np.array(
-        [env[p:p+n].min() if n > 0 else np.inf for p, n in zip(ptr, nprim)],
-        dtype=np.float64)
-    bas_coords = atom_coords[bas[:, gto.ATOM_OF]]
+    if bas_min_exp is None:
+        bas_min_exp = _compute_bas_min_exp(bas, env)
+    bas_atom = bas[:, gto.ATOM_OF]
+    bas_coords = atom_coords[bas_atom]
 
     ecpbas = np.asarray(ecpbas)
     ngrp = len(ecp_loc) - 1
-    ecp_min_exp = np.empty(ngrp, dtype=np.float64)
-    ecp_coords = np.empty((ngrp, 3), dtype=np.float64)
-    for g in range(ngrp):
-        rows = ecpbas[ecp_loc[g]:ecp_loc[g+1]]
-        exps = [env[r[gto.PTR_EXP]:r[gto.PTR_EXP]+r[gto.NPRIM_OF]] for r in rows]
-        exps = np.concatenate(exps) if exps else np.empty(0)
-        ecp_min_exp[g] = exps.min() if exps.size else 0.0
-        ecp_coords[g] = atom_coords[rows[0, gto.ATOM_OF]]
-    return bas_min_exp, bas_coords, ecp_min_exp, ecp_coords
+    if ngrp > 0 and len(ecpbas) > 0:
+        if ecp_min_exp is None:
+            ecp_min_exp = _compute_ecp_min_exp(ecpbas, ecp_loc, env)
+        ecp_atom = ecpbas[ecp_loc[:-1], gto.ATOM_OF]
+        ecp_coords = atom_coords[ecp_atom]
+    else:
+        ecp_min_exp = np.zeros(max(ngrp, 0), dtype=np.float64)
+        ecp_coords = np.empty((max(ngrp, 0), 3), dtype=np.float64)
+        ecp_atom = np.empty(0, dtype=np.int32)
+
+    diff_atm = atom_coords[:, None, :] - atom_coords[None, :, :]
+    dist2_atm = np.einsum('ijk,ijk->ij', diff_atm, diff_atm)
+    rrab = dist2_atm[bas_atom[:, None], bas_atom[None, :]]
+    if ngrp > 0 and len(ecpbas) > 0:
+        rrca = dist2_atm[bas_atom[:, None], ecp_atom[None, :]]
+    else:
+        rrca = np.empty((len(bas), 0), dtype=np.float64)
+
+    with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+        l1_lhs = bas_min_exp[:, None] * ecp_min_exp[None, :] * rrca
+        l1_rhs_fac = bas_min_exp[:, None] + ecp_min_exp[None, :]
+
+    return _ScreenData(bas_min_exp, bas_coords, ecp_min_exp, ecp_coords,
+                       rrca=rrca, rrab=rrab,
+                       l1_lhs=l1_lhs, l1_rhs_fac=l1_rhs_fac)
 
 
 def _screen_grid(grid, screen_data, expcutoff):
@@ -122,12 +212,17 @@ def _screen_grid(grid, screen_data, expcutoff):
     ai = bas_min_exp[ish]
     aj = bas_min_exp[jsh]
     ak = ecp_min_exp[ksh]
-    rab = bas_coords[ish] - bas_coords[jsh]
-    rca = ecp_coords[ksh] - bas_coords[ish]
-    rcb = ecp_coords[ksh] - bas_coords[jsh]
-    rrab = np.sum(rab*rab, axis=1)
-    rrca = np.sum(rca*rca, axis=1)
-    rrcb = np.sum(rcb*rcb, axis=1)
+    if getattr(screen_data, 'rrca', None) is not None:
+        rrab = screen_data.rrab[ish, jsh]
+        rrca = screen_data.rrca[ish, ksh]
+        rrcb = screen_data.rrca[jsh, ksh]
+    else:
+        rab = bas_coords[ish] - bas_coords[jsh]
+        rca = ecp_coords[ksh] - bas_coords[ish]
+        rcb = ecp_coords[ksh] - bas_coords[jsh]
+        rrab = np.sum(rab*rab, axis=1)
+        rrca = np.sum(rca*rca, axis=1)
+        rrcb = np.sum(rcb*rcb, axis=1)
     with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
         eijk = (ai*aj*rrab + ai*ak*rrca + aj*ak*rrcb) / (ai + aj + ak)
     return grid[eijk < expcutoff]
@@ -160,8 +255,9 @@ def sort_ecp_basis(_ecpbas, cart=True, log=None):
 
     return _ecpbas, uniq_l, l_counts, ecp_loc
 
+
 def _screen_block(ish_range, jsh_range, ksh_range, screen_data, expcutoff,
-                  triangular):
+                  triangular, return_columns=False):
     '''(ish, jsh, ksh) task rows surviving the 3-center overlap screen, built
     without ever materializing the full ish x jsh x ksh grid.
 
@@ -170,57 +266,134 @@ def _screen_block(ish_range, jsh_range, ksh_range, screen_data, expcutoff,
          exponent -> 0) is above threshold:
              ai*ak*|C-Ri|^2  <  expcutoff * (ai + ak)
       2. run the full check_3c_overlap estimate on the surviving (i, j) pairs.
-    When nothing screens out (small/dense systems) level 2 costs the same as the
-    old full meshgrid; when most triples are negligible the work collapses to
-    the small surviving neighborhood.
+    Tasks are ordered in (j, i, k) order (k fastest, i next, j slowest) to
+    maximize L1/L2 cache locality across CUDA threadblocks.
     '''
     bas_min_exp, bas_coords, ecp_min_exp, ecp_coords = screen_data
-    ish_range = np.asarray(ish_range)
-    jsh_range = np.asarray(jsh_range)
-    ai_all = bas_min_exp[ish_range]
-    aj_all = bas_min_exp[jsh_range]
-    ri_all = bas_coords[ish_range]
-    rj_all = bas_coords[jsh_range]
+    ish_range = np.asarray(ish_range, dtype=np.int32)
+    jsh_range = np.asarray(jsh_range, dtype=np.int32)
+    ksh_range = np.asarray(ksh_range, dtype=np.int32)
+    if ish_range.size == 0 or jsh_range.size == 0 or ksh_range.size == 0:
+        return [] if return_columns else np.zeros((0, 3), dtype=np.int64)
 
-    out = []
-    # inf exponents (zero-primitive padding shells) produce inf/nan below; those
-    # compare False and are dropped, which is the intended outcome.
+    has_precomp = getattr(screen_data, 'rrca', None) is not None
+    out_cols = []
+
     with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
-        for k in ksh_range:
-            ak = ecp_min_exp[k]
-            ck = ecp_coords[k]
-            rrca = np.sum((ri_all - ck)**2, axis=1)
-            rrcb = np.sum((rj_all - ck)**2, axis=1)
-            i_keep = ish_range[ai_all*ak*rrca < expcutoff * (ai_all + ak)]
-            j_keep = jsh_range[aj_all*ak*rrcb < expcutoff * (aj_all + ak)]
-            if i_keep.size == 0 or j_keep.size == 0:
-                continue
-            ii, jj = np.meshgrid(i_keep, j_keep, indexing='ij')
-            ii = ii.ravel()
-            jj = jj.ravel()
-            if triangular:
-                m = ii <= jj
-                ii = ii[m]
-                jj = jj[m]
-                if ii.size == 0:
+        if has_precomp:
+            rrca_mat = screen_data.rrca
+            rrab_mat = screen_data.rrab
+            l1_lhs = screen_data.l1_lhs
+            l1_rhs_fac = screen_data.l1_rhs_fac
+            keep_ik = (l1_lhs[np.ix_(ish_range, ksh_range)]
+                       < expcutoff * l1_rhs_fac[np.ix_(ish_range, ksh_range)])
+            if triangular and ish_range.shape == jsh_range.shape and (
+                    ish_range[0] == jsh_range[0] and ish_range[-1] == jsh_range[-1]):
+                keep_jk = keep_ik
+            else:
+                keep_jk = (l1_lhs[np.ix_(jsh_range, ksh_range)]
+                           < expcutoff * l1_rhs_fac[np.ix_(jsh_range, ksh_range)])
+
+            for idx_k, k in enumerate(ksh_range):
+                i_keep = ish_range[keep_ik[:, idx_k]]
+                j_keep = jsh_range[keep_jk[:, idx_k]]
+                if i_keep.size == 0 or j_keep.size == 0:
                     continue
-            aii = bas_min_exp[ii]
-            ajj = bas_min_exp[jj]
-            rab = bas_coords[ii] - bas_coords[jj]
-            rca = ck - bas_coords[ii]
-            rcb = ck - bas_coords[jj]
-            eijk = (aii*ajj*np.sum(rab*rab, axis=1)
-                    + aii*ak*np.sum(rca*rca, axis=1)
-                    + ajj*ak*np.sum(rcb*rcb, axis=1)) / (aii + ajj + ak)
-            m = eijk < expcutoff
-            if np.any(m):
-                kk = np.full(int(np.count_nonzero(m)), k, dtype=np.int64)
-                out.append(np.stack(
-                    [ii[m].astype(np.int64), jj[m].astype(np.int64), kk],
-                    axis=1))
-    if out:
-        return np.concatenate(out, axis=0)
-    return np.zeros((0, 3), dtype=np.int64)
+                # indexing='xy' orders jj outer (slowest), ii inner (faster)
+                ii, jj = np.meshgrid(i_keep, j_keep, indexing='xy')
+                ii = ii.ravel()
+                jj = jj.ravel()
+                if triangular:
+                    m = ii <= jj
+                    ii = ii[m]
+                    jj = jj[m]
+                    if ii.size == 0:
+                        continue
+                aii = bas_min_exp[ii]
+                ajj = bas_min_exp[jj]
+                ak = ecp_min_exp[k]
+                eijk = (aii * ajj * rrab_mat[ii, jj]
+                        + aii * ak * rrca_mat[ii, k]
+                        + ajj * ak * rrca_mat[jj, k]) / (aii + ajj + ak)
+                m = eijk < expcutoff
+                if np.any(m):
+                    ii_m = ii[m]
+                    jj_m = jj[m]
+                    kk_m = np.full(ii_m.size, k, dtype=np.int32)
+                    out_cols.append((ii_m, jj_m, kk_m))
+        else:
+            ai_all = bas_min_exp[ish_range]
+            aj_all = bas_min_exp[jsh_range]
+            ri_all = bas_coords[ish_range]
+            rj_all = bas_coords[jsh_range]
+            for k in ksh_range:
+                ak = ecp_min_exp[k]
+                ck = ecp_coords[k]
+                rrca = np.sum((ri_all - ck)**2, axis=1)
+                rrcb = np.sum((rj_all - ck)**2, axis=1)
+                i_keep = ish_range[ai_all*ak*rrca < expcutoff * (ai_all + ak)]
+                j_keep = jsh_range[aj_all*ak*rrcb < expcutoff * (aj_all + ak)]
+                if i_keep.size == 0 or j_keep.size == 0:
+                    continue
+                ii, jj = np.meshgrid(i_keep, j_keep, indexing='xy')
+                ii = ii.ravel()
+                jj = jj.ravel()
+                if triangular:
+                    m = ii <= jj
+                    ii = ii[m]
+                    jj = jj[m]
+                    if ii.size == 0:
+                        continue
+                aii = bas_min_exp[ii]
+                ajj = bas_min_exp[jj]
+                rab = bas_coords[ii] - bas_coords[jj]
+                rca = ck - bas_coords[ii]
+                rcb = ck - bas_coords[jj]
+                eijk = (aii*ajj*np.sum(rab*rab, axis=1)
+                        + aii*ak*np.sum(rca*rca, axis=1)
+                        + ajj*ak*np.sum(rcb*rcb, axis=1)) / (aii + ajj + ak)
+                m = eijk < expcutoff
+                if np.any(m):
+                    ii_m = ii[m]
+                    jj_m = jj[m]
+                    kk_m = np.full(ii_m.size, k, dtype=np.int32)
+                    out_cols.append((ii_m, jj_m, kk_m))
+
+    if return_columns:
+        return out_cols
+    if not out_cols:
+        return np.zeros((0, 3), dtype=np.int64)
+    if len(out_cols) == 1:
+        ii_m, jj_m, kk_m = out_cols[0]
+    else:
+        ii_m = np.concatenate([c[0] for c in out_cols])
+        jj_m = np.concatenate([c[1] for c in out_cols])
+        kk_m = np.concatenate([c[2] for c in out_cols])
+    return np.column_stack((ii_m, jj_m, kk_m)).astype(np.int64)
+
+
+def _unscreened_block_columns(ish_range, jsh_range, ksh_range, triangular):
+    '''Build unscreened (ii, jj, kk) int32 column arrays in (j, i, k) order
+    (k fastest, i next, j slowest), matching original GPU4PySCF ordering.
+    '''
+    ish_range = np.asarray(ish_range, dtype=np.int32)
+    jsh_range = np.asarray(jsh_range, dtype=np.int32)
+    ksh_range = np.asarray(ksh_range, dtype=np.int32)
+    if ish_range.size == 0 or jsh_range.size == 0 or ksh_range.size == 0:
+        empty = np.empty(0, dtype=np.int32)
+        return empty, empty, empty
+    # np.meshgrid(ish_range, jsh_range, ksh_range) uses indexing='xy', which
+    # orders jsh slowest, ish middle, ksh fastest.
+    ii, jj, kk = np.meshgrid(ish_range, jsh_range, ksh_range)
+    ii = ii.ravel()
+    jj = jj.ravel()
+    kk = kk.ravel()
+    if triangular:
+        m = ii <= jj
+        ii = ii[m]
+        jj = jj[m]
+        kk = kk[m]
+    return ii, jj, kk
 
 
 def _build_tasks(l_ctr_offsets, lecp_ctr_offsets, screen_data, expcutoff,
@@ -233,18 +406,19 @@ def _build_tasks(l_ctr_offsets, lecp_ctr_offsets, screen_data, expcutoff,
         j_start = i if triangular else 0
         for j in range(j_start, n_groups):
             for k in range(n_ecp_groups):
-                ish_range = np.arange(l_ctr_offsets[i], l_ctr_offsets[i+1])
-                jsh_range = np.arange(l_ctr_offsets[j], l_ctr_offsets[j+1])
-                ksh_range = np.arange(lecp_ctr_offsets[k], lecp_ctr_offsets[k+1])
+                ish_range = np.arange(
+                    l_ctr_offsets[i], l_ctr_offsets[i+1], dtype=np.int32)
+                jsh_range = np.arange(
+                    l_ctr_offsets[j], l_ctr_offsets[j+1], dtype=np.int32)
+                ksh_range = np.arange(
+                    lecp_ctr_offsets[k], lecp_ctr_offsets[k+1], dtype=np.int32)
                 if do_screen:
                     grid = _screen_block(ish_range, jsh_range, ksh_range,
                                          screen_data, expcutoff, triangular)
                 else:
-                    grid = np.stack(
-                        np.meshgrid(ish_range, jsh_range, ksh_range),
-                        axis=-1).reshape(-1, 3)
-                    if triangular:
-                        grid = grid[grid[:, 0] <= grid[:, 1]]
+                    ii, jj, kk = _unscreened_block_columns(
+                        ish_range, jsh_range, ksh_range, triangular)
+                    grid = np.column_stack((ii, jj, kk)).astype(np.int64)
                 tasks[i, j, k] = grid
     return tasks
 
@@ -260,22 +434,292 @@ def make_full_tasks(l_ctr_offsets, lecp_ctr_offsets, screen_data=None,
     return _build_tasks(l_ctr_offsets, lecp_ctr_offsets, screen_data,
                         expcutoff, triangular=False)
 
+
+def _build_packed_tasks(l_ctr_offsets, lecp_ctr_offsets, uniq_l_ctr, uniq_lecp,
+                        screen_data, expcutoff, triangular):
+    '''Build and pack all non-empty (i, j, k) task grids into a single 1D int32
+    GPU buffer.
+
+    Each CUDA kernel expects `tasks` of length `3 * ntasks` laid out as
+    `[ish_0..ish_{n-1}, jsh_0..jsh_{n-1}, ksh_0..ksh_{n-1}]` (Fortran order of
+    an `(ntasks, 3)` array). Packing all `(i, j, k)` buckets end-to-end into one
+    contiguous 1D buffer replaces hundreds of small `cp.asarray(..., order='F')`
+    allocations and host-to-device transfers with a single transfer.
+
+    Returns
+        (tasks_flat_gpu, launch_specs)
+        where `launch_specs` is a list of `(off_ints, ntasks, li, lj, lk)`.
+    '''
+    n_groups = len(l_ctr_offsets) - 1
+    n_ecp_groups = len(lecp_ctr_offsets) - 1
+    do_screen = screen_data is not None and SCREEN_ECP
+
+    ish_ranges = [np.arange(l_ctr_offsets[i], l_ctr_offsets[i+1], dtype=np.int32)
+                  for i in range(n_groups)]
+    ksh_ranges = [np.arange(lecp_ctr_offsets[k], lecp_ctr_offsets[k+1], dtype=np.int32)
+                  for k in range(n_ecp_groups)]
+
+    flat_segments = []
+    launch_specs = []
+    off_ints = 0
+
+    for i in range(n_groups):
+        ish_range = ish_ranges[i]
+        li = int(uniq_l_ctr[i, 0])
+        j_start = i if triangular else 0
+        for j in range(j_start, n_groups):
+            jsh_range = ish_ranges[j]
+            lj = int(uniq_l_ctr[j, 0])
+            for k in range(n_ecp_groups):
+                ksh_range = ksh_ranges[k]
+                lk = int(uniq_lecp[k])
+                if do_screen:
+                    cols = _screen_block(
+                        ish_range, jsh_range, ksh_range,
+                        screen_data, expcutoff, triangular,
+                        return_columns=True)
+                    if not cols:
+                        continue
+                    if len(cols) == 1:
+                        ii, jj, kk = cols[0]
+                    else:
+                        ii = np.concatenate([c[0] for c in cols])
+                        jj = np.concatenate([c[1] for c in cols])
+                        kk = np.concatenate([c[2] for c in cols])
+                else:
+                    ii, jj, kk = _unscreened_block_columns(
+                        ish_range, jsh_range, ksh_range, triangular)
+                    if ii.size == 0:
+                        continue
+                ntasks = int(ii.size)
+                flat_segments.extend((ii, jj, kk))
+                launch_specs.append((off_ints, ntasks, li, lj, lk))
+                off_ints += 3 * ntasks
+
+    if not launch_specs:
+        return cp.empty(0, dtype=np.int32), []
+    tasks_flat_host = np.concatenate(flat_segments)
+    tasks_flat_gpu = cp.asarray(tasks_flat_host, dtype=np.int32)
+    return tasks_flat_gpu, launch_specs
+
+
 def select_basis(ecpbas, ecp_atoms):
     """
     Select ECP basis for given ECP atoms, and reindexing atoms
     """
-    atom_map = {}
-    for idx, ecp_atom in enumerate(ecp_atoms):
-        atom_map[ecp_atom] = idx
+    ecp_atoms_list = list(ecp_atoms)
+    if len(ecpbas) == 0 or len(ecp_atoms_list) == 0:
+        return np.empty((0, ecpbas.shape[1] if ecpbas.ndim == 2 else 8),
+                        dtype=ecpbas.dtype)
+    ecpbas = np.asarray(ecpbas)
+    atm_ids = ecpbas[:, gto.ATOM_OF]
+    mask = np.isin(atm_ids, ecp_atoms_list)
+    selected = ecpbas[mask].copy()
+    if len(selected) == 0:
+        return selected
+    atom_map = {int(a): idx for idx, a in enumerate(ecp_atoms_list)}
+    selected[:, ECP_ATOM_ID] = [atom_map[int(a)] for a in selected[:, gto.ATOM_OF]]
+    return selected
 
-    selected_ecpbas = []
-    for idx, bas in enumerate(ecpbas):
-        atm_id = bas[gto.ATOM_OF]
-        if atm_id in ecp_atoms:
-            bas_copy = bas.copy()
-            bas_copy[ECP_ATOM_ID] = atom_map[atm_id]
-            selected_ecpbas.append(bas_copy)
-    return np.array(selected_ecpbas)
+
+_TOPO_CACHE = OrderedDict()
+_TOPO_CACHE_MAXSIZE = 8
+_GEOM_CACHE = OrderedDict()
+_GEOM_CACHE_MAXSIZE = 16
+
+
+def _make_topo_key(mol):
+    device_id = cp.cuda.Device().id
+    env_nocoord = mol._env.copy()
+    if len(mol._atm) > 0:
+        ptrs = mol._atm[:, gto.PTR_COORD][:, None] + np.arange(3)
+        valid = (ptrs >= 0) & (ptrs < env_nocoord.size)
+        env_nocoord[ptrs[valid]] = 0.0
+    atm_topo = np.delete(mol._atm, gto.PTR_COORD, axis=1) if len(mol._atm) else mol._atm
+    return (
+        device_id,
+        bool(mol.cart),
+        mol._bas.shape,
+        hash(mol._bas.tobytes()),
+        mol._ecpbas.shape,
+        hash(mol._ecpbas.tobytes()),
+        atm_topo.shape,
+        hash(atm_topo.tobytes()),
+        env_nocoord.shape,
+        hash(env_nocoord.tobytes()),
+    )
+
+
+class _EcpTopologyCache:
+    '''Tier-1 topology cache: stores geometry-invariant sorted basis, angular
+    momentum group offsets, AO transformation matrix, and sorted ECP tables.
+    '''
+    def __init__(self, mol, key):
+        self.key = key
+        _sorted_mol, coeff, uniq_l_ctr, l_ctr_counts = group_basis(mol)
+        uniq_l_ctr, l_ctr_counts = _collapse_l_groups(uniq_l_ctr, l_ctr_counts)
+        self._sorted_mol = _sorted_mol
+        self.base_env = _sorted_mol._env.copy()
+        self.uniq_l_ctr = uniq_l_ctr
+        self.l_ctr_counts = l_ctr_counts
+        self.l_ctr_offsets = np.append(0, np.cumsum(l_ctr_counts))
+        self.n_groups = len(uniq_l_ctr)
+
+        self.bas_min_exp = _compute_bas_min_exp(
+            _sorted_mol._bas, _sorted_mol._env)
+
+        ao_loc = _sorted_mol.ao_loc_nr(cart=True)
+        self.nao = int(ao_loc[-1])
+        self.ao_loc_gpu = cp.asarray(ao_loc, dtype=np.int32)
+        self.coeff_gpu = cp.asarray(coeff)
+        self.atm_gpu = cp.asarray(_sorted_mol._atm, dtype=np.int32)
+        self.bas_gpu = cp.asarray(_sorted_mol._bas, dtype=np.int32)
+
+        # Scalar ECP basis (full molecule)
+        ecpbas_s, uniq_lecp_s, lecp_counts_s, ecp_loc_s = sort_ecp_basis(
+            _sorted_mol._ecpbas)
+        self.ecpbas_scalar = ecpbas_s
+        self.uniq_lecp_scalar = uniq_lecp_s
+        self.lecp_offsets_scalar = np.append(0, np.cumsum(lecp_counts_s))
+        self.ecp_loc_scalar = ecp_loc_s
+        self.ecp_min_exp_scalar = _compute_ecp_min_exp(
+            ecpbas_s, ecp_loc_s, _sorted_mol._env)
+        self.ecpbas_scalar_gpu = cp.asarray(ecpbas_s, dtype=np.int32)
+        self.ecploc_scalar_gpu = cp.asarray(ecp_loc_s, dtype=np.int32)
+
+        # Default derivative ECP basis (with ECP_ATOM_ID reindexed 0..n_ecp_atm-1)
+        self.default_ecp_atoms = sorted(
+            set(int(a) for a in mol._ecpbas[:, gto.ATOM_OF]))
+        ecpbas_d = select_basis(mol._ecpbas, self.default_ecp_atoms)
+        ecpbas_d, uniq_lecp_d, lecp_counts_d, ecp_loc_d = sort_ecp_basis(
+            ecpbas_d)
+        self.ecpbas_deriv_default = ecpbas_d
+        self.uniq_lecp_deriv_default = uniq_lecp_d
+        self.lecp_offsets_deriv_default = np.append(
+            0, np.cumsum(lecp_counts_d))
+        self.ecp_loc_deriv_default = ecp_loc_d
+        self.ecp_min_exp_deriv_default = _compute_ecp_min_exp(
+            ecpbas_d, ecp_loc_d, _sorted_mol._env)
+        self.ecpbas_deriv_default_gpu = cp.asarray(ecpbas_d, dtype=np.int32)
+        self.ecploc_deriv_default_gpu = cp.asarray(ecp_loc_d, dtype=np.int32)
+
+        # Spin-orbit ECP basis (lazy)
+        self._so_initialized = False
+
+    def ensure_so(self):
+        if not self._so_initialized:
+            ecpbas_so, uniq_lecp_so, lecp_counts_so, ecp_loc_so = (
+                sort_ecp_basis_so(self._sorted_mol._ecpbas))
+            self.ecpbas_so = ecpbas_so
+            self.uniq_lecp_so = uniq_lecp_so
+            self.lecp_offsets_so = np.append(0, np.cumsum(lecp_counts_so))
+            self.ecp_loc_so = ecp_loc_so
+            self.ecp_min_exp_so = _compute_ecp_min_exp(
+                ecpbas_so, ecp_loc_so, self._sorted_mol._env)
+            self.ecpbas_so_gpu = cp.asarray(ecpbas_so, dtype=np.int32)
+            self.ecploc_so_gpu = cp.asarray(ecp_loc_so, dtype=np.int32)
+            self._so_initialized = True
+
+
+class _EcpGeometryCache:
+    '''Tier-2 geometry cache: stores coordinate-dependent screening tables,
+    device `_env` array, and packed GPU task buffers.
+    '''
+    def __init__(self, mol, topo, expcutoff):
+        self.topo = topo
+        self.expcutoff = expcutoff
+        coords = np.asarray(mol.atom_coords(), dtype=np.float64)
+        env = topo.base_env.copy()
+        if len(topo._sorted_mol._atm) > 0:
+            ptrs = topo._sorted_mol._atm[:, gto.PTR_COORD][:, None] + np.arange(3)
+            env[ptrs] = coords
+        self.env_host = env
+        self.activate()
+        self.env_gpu = cp.asarray(env, dtype=np.float64)
+
+        self.screen_data_scalar = _build_screen_data(
+            topo._sorted_mol, topo.ecpbas_scalar, topo.ecp_loc_scalar,
+            bas_min_exp=topo.bas_min_exp,
+            ecp_min_exp=topo.ecp_min_exp_scalar)
+
+        self._packed_scalar_tri = None
+        self._packed_deriv_default_full = None
+        self._packed_so_tri = None
+
+    def activate(self):
+        '''Point the shared Tier-1 ``_sorted_mol`` at THIS geometry's host
+        ``_env`` so that any screening table built lazily below (deriv / SO
+        task lists, or per-batch subsets in ``_EcpDerivContext.run_batch``)
+        sees the coordinates that match ``env_gpu``.  Several geometries can
+        share one topology object (geometry optimisation, finite differences),
+        and the last geometry constructed must not leak into the others.
+        '''
+        self.topo._sorted_mol._env = self.env_host
+
+    def packed_scalar_tri(self):
+        if self._packed_scalar_tri is None:
+            t = self.topo
+            self.activate()
+            self._packed_scalar_tri = _build_packed_tasks(
+                t.l_ctr_offsets, t.lecp_offsets_scalar,
+                t.uniq_l_ctr, t.uniq_lecp_scalar,
+                self.screen_data_scalar, self.expcutoff, triangular=True)
+        return self._packed_scalar_tri
+
+    def packed_deriv_default_full(self):
+        if self._packed_deriv_default_full is None:
+            t = self.topo
+            self.activate()
+            screen_data_d = _build_screen_data(
+                t._sorted_mol, t.ecpbas_deriv_default, t.ecp_loc_deriv_default,
+                bas_min_exp=t.bas_min_exp,
+                ecp_min_exp=t.ecp_min_exp_deriv_default)
+            self._packed_deriv_default_full = _build_packed_tasks(
+                t.l_ctr_offsets, t.lecp_offsets_deriv_default,
+                t.uniq_l_ctr, t.uniq_lecp_deriv_default,
+                screen_data_d, self.expcutoff, triangular=False)
+        return self._packed_deriv_default_full
+
+    def packed_so_tri(self):
+        if self._packed_so_tri is None:
+            t = self.topo
+            t.ensure_so()
+            self.activate()
+            screen_data_so = _build_screen_data(
+                t._sorted_mol, t.ecpbas_so, t.ecp_loc_so,
+                bas_min_exp=t.bas_min_exp,
+                ecp_min_exp=t.ecp_min_exp_so)
+            self._packed_so_tri = _build_packed_tasks(
+                t.l_ctr_offsets, t.lecp_offsets_so,
+                t.uniq_l_ctr, t.uniq_lecp_so,
+                screen_data_so, self.expcutoff, triangular=True)
+        return self._packed_so_tri
+
+
+def _get_ecp_caches(mol):
+    topo_key = _make_topo_key(mol)
+    topo = _TOPO_CACHE.get(topo_key)
+    if topo is None:
+        topo = _EcpTopologyCache(mol, topo_key)
+        _TOPO_CACHE[topo_key] = topo
+        if len(_TOPO_CACHE) > _TOPO_CACHE_MAXSIZE:
+            _TOPO_CACHE.popitem(last=False)
+    else:
+        _TOPO_CACHE.move_to_end(topo_key)
+
+    expcutoff = _ecp_expcutoff(mol)
+    coords_bytes = np.ascontiguousarray(mol.atom_coords(), dtype=np.float64).tobytes()
+    geom_key = (topo_key, coords_bytes, expcutoff, bool(SCREEN_ECP))
+    geom = _GEOM_CACHE.get(geom_key)
+    if geom is None:
+        geom = _EcpGeometryCache(mol, topo, expcutoff)
+        _GEOM_CACHE[geom_key] = geom
+        if len(_GEOM_CACHE) > _GEOM_CACHE_MAXSIZE:
+            _GEOM_CACHE.popitem(last=False)
+    else:
+        _GEOM_CACHE.move_to_end(geom_key)
+    return topo, geom
+
 
 def get_ecp(mol):
     """
@@ -287,51 +731,30 @@ def get_ecp(mol):
     """
     assert len(mol._ecpbas) > 0
 
-    _sorted_mol, coeff, uniq_l_ctr, l_ctr_counts = group_basis(mol)
+    topo, geom = _get_ecp_caches(mol)
+    tasks_flat_gpu, launch_specs = geom.packed_scalar_tri()
 
-    _ecpbas = _sorted_mol._ecpbas
-    _ecpbas, uniq_lecp, lecp_counts, ecp_loc= sort_ecp_basis(_ecpbas)
-
-    l_ctr_offsets = np.append(0, np.cumsum(l_ctr_counts))
-    lecp_offsets = np.append(0, np.cumsum(lecp_counts))
-
-    screen_data = _build_screen_data(_sorted_mol, _ecpbas, ecp_loc)
-    tasks_all = make_tasks(l_ctr_offsets, lecp_offsets, screen_data,
-                           _ecp_expcutoff(mol))
-
-    atm = cp.asarray(_sorted_mol._atm, dtype=np.int32)
-    bas = cp.asarray(_sorted_mol._bas, dtype=np.int32)
-    env = cp.asarray(_sorted_mol._env, dtype=np.float64)
-
-    ecpbas = cp.asarray(_ecpbas, dtype=np.int32)
-    ecploc = cp.asarray(ecp_loc, dtype=np.int32)
-    n_groups = len(uniq_l_ctr)
-    n_ecp_groups = len(uniq_lecp)
-    ao_loc = _sorted_mol.ao_loc_nr(cart=True)
-    nao = ao_loc[-1]
-    ao_loc = cp.asarray(ao_loc, dtype=np.int32)
-
+    nao = topo.nao
     mat1 = cp.zeros([nao, nao])
-    for i in range(n_groups):
-        for j in range(i,n_groups):
-            for k in range(n_ecp_groups):
-                if len(tasks_all[i,j,k]) == 0:
-                    continue
-                tasks = cp.asarray(tasks_all[i,j,k], dtype=np.int32, order='F')
-                ntasks = len(tasks)
-                li = uniq_l_ctr[i,0]
-                lj = uniq_l_ctr[j,0]
-                lk = uniq_lecp[k]
-                err = libecp.ECP_cart(
-                    mat1.data.ptr, ao_loc.data.ptr, nao,
-                    tasks.data.ptr, ntasks,
-                    ecpbas.data.ptr, ecploc.data.ptr,
-                    atm.data.ptr, bas.data.ptr, env.data.ptr,
-                    li, lj, lk)
-                if err != 0:
-                    raise RuntimeError('ECP CUDA kernel failed.')
-    coeff = cp.asarray(coeff)
-    return coeff.T @ mat1 @ coeff
+    base_ptr = tasks_flat_gpu.data.ptr
+    ao_loc_ptr = topo.ao_loc_gpu.data.ptr
+    ecpbas_ptr = topo.ecpbas_scalar_gpu.data.ptr
+    ecploc_ptr = topo.ecploc_scalar_gpu.data.ptr
+    atm_ptr = topo.atm_gpu.data.ptr
+    bas_ptr = topo.bas_gpu.data.ptr
+    env_ptr = geom.env_gpu.data.ptr
+    mat1_ptr = mat1.data.ptr
+
+    for off_ints, ntasks, li, lj, lk in launch_specs:
+        err = libecp.ECP_cart(
+            mat1_ptr, ao_loc_ptr, nao,
+            base_ptr + off_ints * 4, ntasks,
+            ecpbas_ptr, ecploc_ptr,
+            atm_ptr, bas_ptr, env_ptr,
+            li, lj, lk)
+        if err != 0:
+            raise RuntimeError('ECP CUDA kernel failed.')
+    return topo.coeff_gpu.T @ mat1 @ topo.coeff_gpu
 
 
 def sort_ecp_basis_so(_ecpbas):
@@ -380,47 +803,31 @@ def get_ecp_so(mol):
     if not np.any(mol._ecpbas[:, gto.SO_TYPE_OF] == 1):
         raise ValueError('mol has no spin-orbit ECP projectors')
 
-    _sorted_mol, coeff, uniq_l_ctr, l_ctr_counts = group_basis(mol)
-    _ecpbas, uniq_lecp, lecp_counts, ecp_loc = sort_ecp_basis_so(
-        _sorted_mol._ecpbas)
+    topo, geom = _get_ecp_caches(mol)
+    tasks_flat_gpu, launch_specs = geom.packed_so_tri()
 
-    l_ctr_offsets = np.append(0, np.cumsum(l_ctr_counts))
-    lecp_offsets = np.append(0, np.cumsum(lecp_counts))
-
-    screen_data = _build_screen_data(_sorted_mol, _ecpbas, ecp_loc)
-    tasks_all = make_tasks(l_ctr_offsets, lecp_offsets, screen_data,
-                           _ecp_expcutoff(mol))
-
-    atm = cp.asarray(_sorted_mol._atm, dtype=np.int32)
-    bas = cp.asarray(_sorted_mol._bas, dtype=np.int32)
-    env = cp.asarray(_sorted_mol._env, dtype=np.float64)
-    ecpbas = cp.asarray(_ecpbas, dtype=np.int32)
-    ecploc = cp.asarray(ecp_loc, dtype=np.int32)
-    n_groups = len(uniq_l_ctr)
-    n_ecp_groups = len(uniq_lecp)
-    ao_loc = _sorted_mol.ao_loc_nr(cart=True)
-    nao = int(ao_loc[-1])
-    ao_loc = cp.asarray(ao_loc, dtype=np.int32)
-
+    nao = topo.nao
     mat1 = cp.zeros([3, nao, nao])
-    for i in range(n_groups):
-        for j in range(i, n_groups):
-            for k in range(n_ecp_groups):
-                task = tasks_all[i, j, k]
-                if len(task) == 0:
-                    continue
-                task = cp.asarray(task, dtype=np.int32, order='F')
-                err = libecp.ECP_so_cart(
-                    mat1.data.ptr, ao_loc.data.ptr, nao,
-                    task.data.ptr, len(task),
-                    ecpbas.data.ptr, ecploc.data.ptr,
-                    atm.data.ptr, bas.data.ptr, env.data.ptr,
-                    int(uniq_l_ctr[i, 0]), int(uniq_l_ctr[j, 0]),
-                    int(uniq_lecp[k]))
-                if err != 0:
-                    raise RuntimeError('SO-ECP CUDA kernel failed.')
+    base_ptr = tasks_flat_gpu.data.ptr
+    ao_loc_ptr = topo.ao_loc_gpu.data.ptr
+    ecpbas_ptr = topo.ecpbas_so_gpu.data.ptr
+    ecploc_ptr = topo.ecploc_so_gpu.data.ptr
+    atm_ptr = topo.atm_gpu.data.ptr
+    bas_ptr = topo.bas_gpu.data.ptr
+    env_ptr = geom.env_gpu.data.ptr
+    mat1_ptr = mat1.data.ptr
 
-    coeff = cp.asarray(coeff)
+    for off_ints, ntasks, li, lj, lk in launch_specs:
+        err = libecp.ECP_so_cart(
+            mat1_ptr, ao_loc_ptr, nao,
+            base_ptr + off_ints * 4, ntasks,
+            ecpbas_ptr, ecploc_ptr,
+            atm_ptr, bas_ptr, env_ptr,
+            li, lj, lk)
+        if err != 0:
+            raise RuntimeError('SO-ECP CUDA kernel failed.')
+
+    coeff = topo.coeff_gpu
     mat1 = contract('aij,jq->aiq', mat1, coeff)
     mat1 = contract('aiq,ip->apq', mat1, coeff)
     return mat1
@@ -456,50 +863,63 @@ class _EcpDerivContext:
     selection, screening, task list, kernel launch, AO transform).
     '''
     def __init__(self, mol):
-        self._sorted_mol, coeff, self.uniq_l_ctr, l_ctr_counts = group_basis(mol)
-        self.l_ctr_offsets = np.append(0, np.cumsum(l_ctr_counts))
-        self.expcutoff = _ecp_expcutoff(mol)
+        self.topo, self.geom = _get_ecp_caches(mol)
+        self._sorted_mol = self.topo._sorted_mol
+        self.uniq_l_ctr = self.topo.uniq_l_ctr
+        self.l_ctr_offsets = self.topo.l_ctr_offsets
+        self.expcutoff = self.geom.expcutoff
         self.ecpbas_src = mol._ecpbas
-        self.atm = cp.asarray(self._sorted_mol._atm, dtype=np.int32)
-        self.bas = cp.asarray(self._sorted_mol._bas, dtype=np.int32)
-        self.env = cp.asarray(self._sorted_mol._env, dtype=np.float64)
-        ao_loc = self._sorted_mol.ao_loc_nr(cart=True)
-        self.nao = int(ao_loc[-1])
-        self.ao_loc = cp.asarray(ao_loc, dtype=np.int32)
-        self.coeff = cp.asarray(coeff)
-        self.n_groups = len(self.uniq_l_ctr)
+        self.atm = self.topo.atm_gpu
+        self.bas = self.topo.bas_gpu
+        self.env = self.geom.env_gpu
+        self.nao = self.topo.nao
+        self.ao_loc = self.topo.ao_loc_gpu
+        self.coeff = self.topo.coeff_gpu
+        self.n_groups = self.topo.n_groups
 
     def run_batch(self, fn, comp, ecp_atoms_batch):
         '''[len(ecp_atoms_batch), comp, nao, nao] in the AO (transformed) basis.
         Row r corresponds to ecp_atoms_batch[r].'''
-        ecpbas = select_basis(self.ecpbas_src, list(ecp_atoms_batch))
-        ecpbas, uniq_lecp, lecp_counts, ecp_loc = sort_ecp_basis(ecpbas)
-        lecp_offsets = np.append(0, np.cumsum(lecp_counts))
-        screen_data = _build_screen_data(self._sorted_mol, ecpbas, ecp_loc)
-        tasks_all = make_full_tasks(self.l_ctr_offsets, lecp_offsets,
-                                    screen_data, self.expcutoff)
+        batch_list = [int(a) for a in ecp_atoms_batch]
+        if batch_list == self.topo.default_ecp_atoms:
+            tasks_flat_gpu, launch_specs = self.geom.packed_deriv_default_full()
+            ecpbas_gpu = self.topo.ecpbas_deriv_default_gpu
+            ecploc_gpu = self.topo.ecploc_deriv_default_gpu
+        else:
+            ecpbas = select_basis(self.ecpbas_src, batch_list)
+            ecpbas, uniq_lecp, lecp_counts, ecp_loc = sort_ecp_basis(ecpbas)
+            lecp_offsets = np.append(0, np.cumsum(lecp_counts))
+            self.geom.activate()
+            screen_data = _build_screen_data(
+                self._sorted_mol, ecpbas, ecp_loc,
+                bas_min_exp=self.topo.bas_min_exp)
+            tasks_flat_gpu, launch_specs = _build_packed_tasks(
+                self.l_ctr_offsets, lecp_offsets,
+                self.uniq_l_ctr, uniq_lecp,
+                screen_data, self.expcutoff, triangular=False)
+            ecpbas_gpu = cp.asarray(ecpbas, dtype=np.int32)
+            ecploc_gpu = cp.asarray(ecp_loc, dtype=np.int32)
 
-        ecpbas_gpu = cp.asarray(ecpbas, dtype=np.int32)
-        ecploc_gpu = cp.asarray(ecp_loc, dtype=np.int32)
-        n_ecp_groups = len(uniq_lecp)
-        nbatch = len(ecp_atoms_batch)
+        nbatch = len(batch_list)
         mat1 = cp.zeros([nbatch, comp, self.nao, self.nao])
-        for i in range(self.n_groups):
-            for j in range(self.n_groups):
-                for k in range(n_ecp_groups):
-                    task = tasks_all[i, j, k]
-                    if len(task) == 0:
-                        continue
-                    task = cp.asarray(task, dtype=np.int32, order='F')
-                    err = fn(
-                        mat1.data.ptr, self.ao_loc.data.ptr, self.nao,
-                        task.data.ptr, len(task),
-                        ecpbas_gpu.data.ptr, ecploc_gpu.data.ptr,
-                        self.atm.data.ptr, self.bas.data.ptr, self.env.data.ptr,
-                        int(self.uniq_l_ctr[i, 0]), int(self.uniq_l_ctr[j, 0]),
-                        int(uniq_lecp[k]))
-                    if err != 0:
-                        raise RuntimeError('ECP CUDA kernel failed.')
+        base_ptr = tasks_flat_gpu.data.ptr
+        ao_loc_ptr = self.ao_loc.data.ptr
+        ecpbas_ptr = ecpbas_gpu.data.ptr
+        ecploc_ptr = ecploc_gpu.data.ptr
+        atm_ptr = self.atm.data.ptr
+        bas_ptr = self.bas.data.ptr
+        env_ptr = self.env.data.ptr
+        mat1_ptr = mat1.data.ptr
+
+        for off_ints, ntasks, li, lj, lk in launch_specs:
+            err = fn(
+                mat1_ptr, ao_loc_ptr, self.nao,
+                base_ptr + off_ints * 4, ntasks,
+                ecpbas_ptr, ecploc_ptr,
+                atm_ptr, bas_ptr, env_ptr,
+                li, lj, lk)
+            if err != 0:
+                raise RuntimeError('ECP CUDA kernel failed.')
         mat1 = contract('axij,jq->axiq', mat1, self.coeff)
         mat1 = contract('axiq,ip->axpq', mat1, self.coeff)
         return mat1

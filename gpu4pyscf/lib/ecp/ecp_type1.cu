@@ -46,8 +46,8 @@ void type1_rad_part(double* __restrict__ rad_all, const int LIJ, double k, doubl
         if (lab > 0){
             rur *= r;
         }
-        for (int i = lab%2; i <= LIJ; i+=2){
-            block_reduce(rur*bval[i], rad_all+lab*LIJ1+i);
+        for (int i = lab%2; i <= lab; i+=2){
+            block_reduce_NoSync(rur*bval[i], rad_all+lab*LIJ1+i);
         }
     }
 }
@@ -111,39 +111,39 @@ void type1_rad_ang(double *rad_ang, const int LIJ, double *r, double *rad_all, c
         const int i = n/(LIJ+1)/(LIJ+1);
         const int j = n/(LIJ+1)%(LIJ+1);
         const int k = n%(LIJ+1);
-        if (i+j+k > LIJ || (i+j+k)%2 == 1){
+        const int ijk = i + j + k;
+        if (ijk > LIJ || (ijk & 1) == 1){
             continue;
         }
-        // need_even to ensure (i+j+k+lmb) is even
+        // need_even to ensure (i+j+k+lmb) is even, and lmb <= i+j+k
         double s = 0.0;
-        double *prad = rad_all + (i+j+k)*(LIJ+1);
-        if (LIJ >= 0) s += prad[0] * type1_ang_nuc_l<0>(i, j, k, unitr);
-        if (LIJ >= 2) s += prad[2] * type1_ang_nuc_l<2>(i, j, k, unitr);
-        if (LIJ >= 4) s += prad[4] * type1_ang_nuc_l<4>(i, j, k, unitr);
-        if (LIJ >= 6) s += prad[6] * type1_ang_nuc_l<6>(i, j, k, unitr);
-        if (LIJ >= 8) s += prad[8] * type1_ang_nuc_l<8>(i, j, k, unitr);
-        if (LIJ >= 10)s += prad[10]* type1_ang_nuc_l<10>(i, j, k, unitr);
+        double *prad = rad_all + ijk*(LIJ+1);
+        if (ijk >= 0)  s += prad[0]  * type1_ang_nuc_l<0>(i, j, k, unitr);
+        if (ijk >= 2)  s += prad[2]  * type1_ang_nuc_l<2>(i, j, k, unitr);
+        if (ijk >= 4)  s += prad[4]  * type1_ang_nuc_l<4>(i, j, k, unitr);
+        if (ijk >= 6)  s += prad[6]  * type1_ang_nuc_l<6>(i, j, k, unitr);
+        if (ijk >= 8)  s += prad[8]  * type1_ang_nuc_l<8>(i, j, k, unitr);
+        if (ijk >= 10) s += prad[10] * type1_ang_nuc_l<10>(i, j, k, unitr);
         rad_ang[i*(LIJ+1)*(LIJ+1) + j*(LIJ+1) + k] += fac*s;
-        //atomicAdd(rad_ang + i*(LIJ+1)*(LIJ+1) + j*(LIJ+1) + k, fac*s);
     }
 
     for (int n = threadIdx.x; n < (LIJ+1)*(LIJ+1)*(LIJ+1); n+=blockDim.x){
         const int i = n/(LIJ+1)/(LIJ+1);
         const int j = n/(LIJ+1)%(LIJ+1);
         const int k = n%(LIJ+1);
-        if (i+j+k > LIJ || (i+j+k)%2 == 0){
+        const int ijk = i + j + k;
+        if (ijk > LIJ || (ijk & 1) == 0){
             continue;
         }
-        // need_even to ensure (i+j+k+lmb) is even
+        // need_even to ensure (i+j+k+lmb) is even, and lmb <= i+j+k
         double s = 0.0;
-        double *prad = rad_all + (i+j+k)*(LIJ+1);
-        if (LIJ >= 1) s += prad[1] * type1_ang_nuc_l<1>(i, j, k, unitr);
-        if (LIJ >= 3) s += prad[3] * type1_ang_nuc_l<3>(i, j, k, unitr);
-        if (LIJ >= 5) s += prad[5] * type1_ang_nuc_l<5>(i, j, k, unitr);
-        if (LIJ >= 7) s += prad[7] * type1_ang_nuc_l<7>(i, j, k, unitr);
-        if (LIJ >= 9) s += prad[9] * type1_ang_nuc_l<9>(i, j, k, unitr);
+        double *prad = rad_all + ijk*(LIJ+1);
+        if (ijk >= 1) s += prad[1] * type1_ang_nuc_l<1>(i, j, k, unitr);
+        if (ijk >= 3) s += prad[3] * type1_ang_nuc_l<3>(i, j, k, unitr);
+        if (ijk >= 5) s += prad[5] * type1_ang_nuc_l<5>(i, j, k, unitr);
+        if (ijk >= 7) s += prad[7] * type1_ang_nuc_l<7>(i, j, k, unitr);
+        if (ijk >= 9) s += prad[9] * type1_ang_nuc_l<9>(i, j, k, unitr);
         rad_ang[i*(LIJ+1)*(LIJ+1) + j*(LIJ+1) + k] += fac*s;
-        //atomicAdd(rad_ang + i*(LIJ+1)*(LIJ+1) + j*(LIJ+1) + k, fac*s);
     }
 }
 
@@ -168,39 +168,39 @@ void type1_rad_ang(double *rad_ang, double *r, double *rad_all, const double fac
         const int i = n/(LIJ+1)/(LIJ+1);
         const int j = n/(LIJ+1)%(LIJ+1);
         const int k = n%(LIJ+1);
-        if (i+j+k > LIJ || (i+j+k)%2 == 1){
+        const int ijk = i + j + k;
+        if (ijk > LIJ || (ijk & 1) == 1){
             continue;
         }
-        // need_even to ensure (i+j+k+lmb) is even
+        // need_even to ensure (i+j+k+lmb) is even, and lmb <= i+j+k
         double s = 0.0;
-        double *prad = rad_all + (i+j+k)*(LIJ+1);
-        if constexpr (LIJ >= 0) s += prad[0] * type1_ang_nuc_l<0>(i, j, k, unitr);
-        if constexpr (LIJ >= 2) s += prad[2] * type1_ang_nuc_l<2>(i, j, k, unitr);
-        if constexpr (LIJ >= 4) s += prad[4] * type1_ang_nuc_l<4>(i, j, k, unitr);
-        if constexpr (LIJ >= 6) s += prad[6] * type1_ang_nuc_l<6>(i, j, k, unitr);
-        if constexpr (LIJ >= 8) s += prad[8] * type1_ang_nuc_l<8>(i, j, k, unitr);
-        if constexpr (LIJ >= 10)s += prad[10]* type1_ang_nuc_l<10>(i, j, k, unitr);
+        double *prad = rad_all + ijk*(LIJ+1);
+        if constexpr (LIJ >= 0)  { if (ijk >= 0)  s += prad[0]  * type1_ang_nuc_l<0>(i, j, k, unitr); }
+        if constexpr (LIJ >= 2)  { if (ijk >= 2)  s += prad[2]  * type1_ang_nuc_l<2>(i, j, k, unitr); }
+        if constexpr (LIJ >= 4)  { if (ijk >= 4)  s += prad[4]  * type1_ang_nuc_l<4>(i, j, k, unitr); }
+        if constexpr (LIJ >= 6)  { if (ijk >= 6)  s += prad[6]  * type1_ang_nuc_l<6>(i, j, k, unitr); }
+        if constexpr (LIJ >= 8)  { if (ijk >= 8)  s += prad[8]  * type1_ang_nuc_l<8>(i, j, k, unitr); }
+        if constexpr (LIJ >= 10) { if (ijk >= 10) s += prad[10] * type1_ang_nuc_l<10>(i, j, k, unitr); }
         rad_ang[i*(LIJ+1)*(LIJ+1) + j*(LIJ+1) + k] += fac*s;
-        //atomicAdd(rad_ang + i*(LIJ+1)*(LIJ+1) + j*(LIJ+1) + k, fac*s);
     }
 
     for (int n = threadIdx.x; n < (LIJ+1)*(LIJ+1)*(LIJ+1); n+=blockDim.x){
         const int i = n/(LIJ+1)/(LIJ+1);
         const int j = n/(LIJ+1)%(LIJ+1);
         const int k = n%(LIJ+1);
-        if (i+j+k > LIJ || (i+j+k)%2 == 0){
+        const int ijk = i + j + k;
+        if (ijk > LIJ || (ijk & 1) == 0){
             continue;
         }
-        // need_even to ensure (i+j+k+lmb) is even
+        // need_even to ensure (i+j+k+lmb) is even, and lmb <= i+j+k
         double s = 0.0;
-        double *prad = rad_all + (i+j+k)*(LIJ+1);
-        if constexpr (LIJ >= 1) s += prad[1] * type1_ang_nuc_l<1>(i, j, k, unitr);
-        if constexpr (LIJ >= 3) s += prad[3] * type1_ang_nuc_l<3>(i, j, k, unitr);
-        if constexpr (LIJ >= 5) s += prad[5] * type1_ang_nuc_l<5>(i, j, k, unitr);
-        if constexpr (LIJ >= 7) s += prad[7] * type1_ang_nuc_l<7>(i, j, k, unitr);
-        if constexpr (LIJ >= 9) s += prad[9] * type1_ang_nuc_l<9>(i, j, k, unitr);
+        double *prad = rad_all + ijk*(LIJ+1);
+        if constexpr (LIJ >= 1) { if (ijk >= 1) s += prad[1] * type1_ang_nuc_l<1>(i, j, k, unitr); }
+        if constexpr (LIJ >= 3) { if (ijk >= 3) s += prad[3] * type1_ang_nuc_l<3>(i, j, k, unitr); }
+        if constexpr (LIJ >= 5) { if (ijk >= 5) s += prad[5] * type1_ang_nuc_l<5>(i, j, k, unitr); }
+        if constexpr (LIJ >= 7) { if (ijk >= 7) s += prad[7] * type1_ang_nuc_l<7>(i, j, k, unitr); }
+        if constexpr (LIJ >= 9) { if (ijk >= 9) s += prad[9] * type1_ang_nuc_l<9>(i, j, k, unitr); }
         rad_ang[i*(LIJ+1)*(LIJ+1) + j*(LIJ+1) + k] += fac*s;
-        //atomicAdd(rad_ang + i*(LIJ+1)*(LIJ+1) + j*(LIJ+1) + k, fac*s);
     }
 }
 

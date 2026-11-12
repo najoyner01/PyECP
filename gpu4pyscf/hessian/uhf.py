@@ -169,8 +169,7 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
     dm0a = mocca.dot(mocca.T)
     dm0b = moccb.dot(moccb.T)
     grad_obj = hessobj.base.Gradients()
-    h1moa = rhf_grad.get_grad_hcore(grad_obj, mo_a, mo_occ[0])
-    h1mob = rhf_grad.get_grad_hcore(grad_obj, mo_b, mo_occ[1])
+    h1moa, h1mob = rhf_grad.get_grad_hcore(grad_obj, (mo_a, mo_b), (mo_occ[0], mo_occ[1]))
 
     # Estimate the size of intermediate variables
     # dm, vj, and vk in [natm,3,nao_cart,nao_cart]

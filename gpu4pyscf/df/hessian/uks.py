@@ -96,8 +96,9 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
         h1mo[1] += veff_lr[1]
 
     gobj = hessobj.base.nuc_grad_method()
-    h1mo[0] += rhf_grad.get_grad_hcore(gobj, mo_coeff[0], mo_occ[0])
-    h1mo[1] += rhf_grad.get_grad_hcore(gobj, mo_coeff[1], mo_occ[1])
+    h1a_hcore, h1b_hcore = rhf_grad.get_grad_hcore(gobj, (mo_coeff[0], mo_coeff[1]), (mo_occ[0], mo_occ[1]))
+    h1mo[0] += h1a_hcore
+    h1mo[1] += h1b_hcore
 
     v1moa, v1mob = uks_hess._get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory)
     h1mo[0] += v1moa

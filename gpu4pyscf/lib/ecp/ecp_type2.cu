@@ -51,6 +51,93 @@ void type2_facs_rad(double* facs, const int LIC, const int np, const double rca,
 }
 
 __device__
+void type2_facs_rad_01(double *facs0, double *facs1,
+                       const int LIC0, const int LIC1,
+                       const int np, const double rca,
+                       const double *ci, const double *ai){
+    double root = 0.0;
+    if (threadIdx.x < NGAUSS){
+        root = r128[threadIdx.x];
+    }
+    const double r = root - rca;
+    const double r2 = r*r;
+    for (int j = 0; j <= LIC0; j++){
+        facs0[j] = 0.0;
+    }
+    for (int j = 0; j <= LIC1; j++){
+        facs1[j] = 0.0;
+    }
+
+    for (int ip = 0; ip < np; ip++){
+        const double a = ai[ip];
+        const double ka = 2.0 * a * rca;
+        const double ar2 = a * r2;
+
+        double buf[AO_LMAX+ECP_LMAX+2];
+        if (ar2 > EXPCUTOFF + 6.0){
+            continue;
+        }
+        const double t1 = exp(-ar2);
+        _ine(buf, LIC1, ka*root);
+        const double c0 = ci[ip] * t1;
+        const double c1 = (-2.0 * a) * c0;
+        for (int j = 0; j <= LIC0; j++){
+            facs0[j] += c0 * buf[j];
+        }
+        for (int j = 0; j <= LIC1; j++){
+            facs1[j] += c1 * buf[j];
+        }
+    }
+}
+
+__device__
+void type2_facs_rad_012(double *facs0, double *facs1, double *facs2,
+                        const int LIC0, const int LIC1, const int LIC2,
+                        const int np, const double rca,
+                        const double *ci, const double *ai){
+    double root = 0.0;
+    if (threadIdx.x < NGAUSS){
+        root = r128[threadIdx.x];
+    }
+    const double r = root - rca;
+    const double r2 = r*r;
+    for (int j = 0; j <= LIC0; j++){
+        facs0[j] = 0.0;
+    }
+    for (int j = 0; j <= LIC1; j++){
+        facs1[j] = 0.0;
+    }
+    for (int j = 0; j <= LIC2; j++){
+        facs2[j] = 0.0;
+    }
+
+    for (int ip = 0; ip < np; ip++){
+        const double a = ai[ip];
+        const double ka = 2.0 * a * rca;
+        const double ar2 = a * r2;
+
+        double buf[AO_LMAX+ECP_LMAX+3];
+        if (ar2 > EXPCUTOFF + 6.0){
+            continue;
+        }
+        const double t1 = exp(-ar2);
+        _ine(buf, LIC2, ka*root);
+        const double c0 = ci[ip] * t1;
+        const double c1 = (-2.0 * a) * c0;
+        const double c2 = (-2.0 * a) * c1;
+        for (int j = 0; j <= LIC0; j++){
+            facs0[j] += c0 * buf[j];
+        }
+        for (int j = 0; j <= LIC1; j++){
+            facs1[j] += c1 * buf[j];
+        }
+        for (int j = 0; j <= LIC2; j++){
+            facs2[j] += c2 * buf[j];
+        }
+    }
+}
+
+__device__
 void type2_facs_omega(double* __restrict__ omega, const int LI, const int LC, double *r){
     double unitr[3];
     if (r[0]*r[0] + r[1]*r[1] + r[2]*r[2] < 1e-16){
@@ -70,7 +157,8 @@ void type2_facs_omega(double* __restrict__ omega, const int LI, const int LC, do
         const int i = n/(LI+1)/(LI+1);
         const int j = n/(LI+1)%(LI+1);
         const int k = n%(LI+1);
-        if (i+j+k > LI || (i+j+k+LC)%2 == 1){
+        const int ijk = i + j + k;
+        if (ijk > LI || ((ijk + LC) & 1) == 1){
             continue;
         }
 
@@ -79,14 +167,14 @@ void type2_facs_omega(double* __restrict__ omega, const int LI, const int LC, do
         const int joff = (LI_i-j)*(LI_i-j+1)/2;
         const int blk = (LI+LC+2)/2 * (LC*2+1);
         double *pomega = omega + (ioff+joff+k)*blk;
+        const int ijk_lc = ijk + LC;
 
-        //for (int lmb = need_even; lmb <= LI+LC; lmb+=2){
-        if (LI+LC >= 0)  {type2_ang_nuc_l<0>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
-        if (LI+LC >= 2)  {type2_ang_nuc_l<2>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
-        if (LI+LC >= 4)  {type2_ang_nuc_l<4>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
-        if (LI+LC >= 6)  {type2_ang_nuc_l<6>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
-        if (LI+LC >= 8)  {type2_ang_nuc_l<8>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
-        if (LI+LC >= 10) {type2_ang_nuc_l<10>(pomega, LC, i, j, k, unitr); pomega+=(2*LC+1);}
+        if (ijk_lc >= 0)  {type2_ang_nuc_l<0>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
+        if (ijk_lc >= 2)  {type2_ang_nuc_l<2>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
+        if (ijk_lc >= 4)  {type2_ang_nuc_l<4>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
+        if (ijk_lc >= 6)  {type2_ang_nuc_l<6>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
+        if (ijk_lc >= 8)  {type2_ang_nuc_l<8>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
+        if (ijk_lc >= 10) {type2_ang_nuc_l<10>(pomega, LC, i, j, k, unitr); pomega+=(2*LC+1);}
     }
 
     // When i+j+k + LC is odd
@@ -94,7 +182,8 @@ void type2_facs_omega(double* __restrict__ omega, const int LI, const int LC, do
         const int i = n/(LI+1)/(LI+1);
         const int j = n/(LI+1)%(LI+1);
         const int k = n%(LI+1);
-        if (i+j+k > LI || (i+j+k+LC)%2 == 0){
+        const int ijk = i + j + k;
+        if (ijk > LI || ((ijk + LC) & 1) == 0){
             continue;
         }
         const int LI_i = LI-i;
@@ -102,13 +191,13 @@ void type2_facs_omega(double* __restrict__ omega, const int LI, const int LC, do
         const int joff = (LI_i-j)*(LI_i-j+1)/2;
         const int blk = (LI+LC+2)/2 * (LC*2+1);
         double *pomega = omega + (ioff+joff+k)*blk;
+        const int ijk_lc = ijk + LC;
 
-        //for (int lmb = need_even; lmb <= LI+LC; lmb+=2){
-        if (LI+LC >= 1)  {type2_ang_nuc_l<1>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
-        if (LI+LC >= 3)  {type2_ang_nuc_l<3>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
-        if (LI+LC >= 5)  {type2_ang_nuc_l<5>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
-        if (LI+LC >= 7)  {type2_ang_nuc_l<7>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
-        if (LI+LC >= 9)  {type2_ang_nuc_l<9>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
+        if (ijk_lc >= 1)  {type2_ang_nuc_l<1>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
+        if (ijk_lc >= 3)  {type2_ang_nuc_l<3>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
+        if (ijk_lc >= 5)  {type2_ang_nuc_l<5>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
+        if (ijk_lc >= 7)  {type2_ang_nuc_l<7>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
+        if (ijk_lc >= 9)  {type2_ang_nuc_l<9>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
     }
     __syncthreads();
 }
@@ -133,7 +222,8 @@ void type2_facs_omega(double* __restrict__ omega, double *r){
         const int i = n/(LI+1)/(LI+1);
         const int j = n/(LI+1)%(LI+1);
         const int k = n%(LI+1);
-        if (i+j+k > LI || (i+j+k+LC)%2 == 1){
+        const int ijk = i + j + k;
+        if (ijk > LI || ((ijk + LC) & 1) == 1){
             continue;
         }
 
@@ -142,14 +232,14 @@ void type2_facs_omega(double* __restrict__ omega, double *r){
         const int joff = (LI_i-j)*(LI_i-j+1)/2;
         constexpr int blk = (LI+LC+2)/2 * (LC*2+1);
         double *pomega = omega + (ioff+joff+k)*blk;
+        const int ijk_lc = ijk + LC;
 
-        //for (int lmb = need_even; lmb <= LI+LC; lmb+=2){
-        if constexpr (LI+LC >= 0)  {type2_ang_nuc_l<0>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
-        if constexpr (LI+LC >= 2)  {type2_ang_nuc_l<2>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
-        if constexpr (LI+LC >= 4)  {type2_ang_nuc_l<4>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
-        if constexpr (LI+LC >= 6)  {type2_ang_nuc_l<6>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
-        if constexpr (LI+LC >= 8)  {type2_ang_nuc_l<8>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
-        if constexpr (LI+LC >= 10) {type2_ang_nuc_l<10>(pomega, LC, i, j, k, unitr); pomega+=(2*LC+1);}
+        if constexpr (LI+LC >= 0)  { if (ijk_lc >= 0)  {type2_ang_nuc_l<0>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);} }
+        if constexpr (LI+LC >= 2)  { if (ijk_lc >= 2)  {type2_ang_nuc_l<2>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);} }
+        if constexpr (LI+LC >= 4)  { if (ijk_lc >= 4)  {type2_ang_nuc_l<4>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);} }
+        if constexpr (LI+LC >= 6)  { if (ijk_lc >= 6)  {type2_ang_nuc_l<6>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);} }
+        if constexpr (LI+LC >= 8)  { if (ijk_lc >= 8)  {type2_ang_nuc_l<8>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);} }
+        if constexpr (LI+LC >= 10) { if (ijk_lc >= 10) {type2_ang_nuc_l<10>(pomega, LC, i, j, k, unitr); pomega+=(2*LC+1);} }
     }
 
     // When i+j+k + LC is odd
@@ -157,7 +247,8 @@ void type2_facs_omega(double* __restrict__ omega, double *r){
         const int i = n/(LI+1)/(LI+1);
         const int j = n/(LI+1)%(LI+1);
         const int k = n%(LI+1);
-        if (i+j+k > LI || (i+j+k+LC)%2 == 0){
+        const int ijk = i + j + k;
+        if (ijk > LI || ((ijk + LC) & 1) == 0){
             continue;
         }
         const int LI_i = LI-i;
@@ -165,13 +256,13 @@ void type2_facs_omega(double* __restrict__ omega, double *r){
         const int joff = (LI_i-j)*(LI_i-j+1)/2;
         constexpr int blk = (LI+LC+2)/2 * (LC*2+1);
         double *pomega = omega + (ioff+joff+k)*blk;
+        const int ijk_lc = ijk + LC;
 
-        //for (int lmb = need_even; lmb <= LI+LC; lmb+=2){
-        if constexpr (LI+LC >= 1)  {type2_ang_nuc_l<1>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
-        if constexpr (LI+LC >= 3)  {type2_ang_nuc_l<3>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
-        if constexpr (LI+LC >= 5)  {type2_ang_nuc_l<5>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
-        if constexpr (LI+LC >= 7)  {type2_ang_nuc_l<7>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
-        if constexpr (LI+LC >= 9)  {type2_ang_nuc_l<9>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);}
+        if constexpr (LI+LC >= 1)  { if (ijk_lc >= 1) {type2_ang_nuc_l<1>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);} }
+        if constexpr (LI+LC >= 3)  { if (ijk_lc >= 3) {type2_ang_nuc_l<3>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);} }
+        if constexpr (LI+LC >= 5)  { if (ijk_lc >= 5) {type2_ang_nuc_l<5>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);} }
+        if constexpr (LI+LC >= 7)  { if (ijk_lc >= 7) {type2_ang_nuc_l<7>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);} }
+        if constexpr (LI+LC >= 9)  { if (ijk_lc >= 9) {type2_ang_nuc_l<9>(pomega, LC, i, j, k, unitr);  pomega+=(2*LC+1);} }
     }
 }
 
@@ -210,12 +301,12 @@ void type2_ang(double * __restrict__ facs, const int LI, const int LC, double *r
         for (int j = 0; j <= iy; j++){
         for (int k = 0; k <= iz; k++){
             const int ijk = i+j+k;
-            const double fac = fi[i+ix_off] * fi[j+iy_off] * fi[k+iz_off];
-            const int LI_i = LI-i;
-            const int ioff = (LI_i)*(LI_i+1)*(LI_i+2)/6;
-            const int joff = (LI_i-j)*(LI_i-j+1)/2;
-            double *pomega = omega + (ioff+joff+k)*BLK;
-            if ((LC+ijk)%2 == m%2){
+            if (((LC+ijk) & 1) == (m & 1) && m <= LC+ijk){
+                const double fac = fi[i+ix_off] * fi[j+iy_off] * fi[k+iz_off];
+                const int LI_i = LI-i;
+                const int ioff = (LI_i)*(LI_i+1)*(LI_i+2)/6;
+                const int joff = (LI_i-j)*(LI_i-j+1)/2;
+                double *pomega = omega + (ioff+joff+k)*BLK;
                 ang_pmn[ijk] += fac * pomega[m/2*LCC1];
             }
         }}}
@@ -260,12 +351,12 @@ void type2_ang(double * __restrict__ facs, double *rca, double *omega){
         for (int j = 0; j <= iy; j++){
         for (int k = 0; k <= iz; k++){
             const int ijk = i+j+k;
-            const double fac = fi[i+ix_off] * fi[j+iy_off] * fi[k+iz_off];
-            const int LI_i = LI-i;
-            const int ioff = (LI_i)*(LI_i+1)*(LI_i+2)/6;
-            const int joff = (LI_i-j)*(LI_i-j+1)/2;
-            double *pomega = omega + (ioff+joff+k)*BLK;
-            if ((LC+ijk)%2 == m%2){
+            if (((LC+ijk) & 1) == (m & 1) && m <= LC+ijk){
+                const double fac = fi[i+ix_off] * fi[j+iy_off] * fi[k+iz_off];
+                const int LI_i = LI-i;
+                const int ioff = (LI_i)*(LI_i+1)*(LI_i+2)/6;
+                const int joff = (LI_i-j)*(LI_i-j+1)/2;
+                double *pomega = omega + (ioff+joff+k)*BLK;
                 ang_pmn[ijk] += fac * pomega[m/2*LCC1];
             }
         }}}
@@ -353,9 +444,11 @@ void type2_cart(double * __restrict__ gctr,
     for (int p = 0; p <= LI+LJ; p++){
         double *prad = rad_all + p*LIC1*LJC1;
         for (int i = 0; i <= LI+LC; i++){
-        for (int j = 0; j <= LJ+LC; j++){
-            block_reduce(radi[i]*radj[j]*ur, prad+i*LJC1+j);
-        }}
+            const double ri_ur = radi[i] * ur;
+            for (int j = (p + i) & 1; j <= LJ+LC; j += 2){
+                block_reduce_NoSync(ri_ur * radj[j], prad + i*LJC1 + j);
+            }
+        }
         ur *= root;
     }
     __syncthreads();
@@ -385,17 +478,16 @@ void type2_cart(double * __restrict__ gctr,
             double s = 0;
             for (int k = 0; k <= LI; k++){
             for (int l = 0; l <= LJ; l++){
-                double *pangi = angi + k*nfi*LIC1 + i*LIC1;
-                double *pangj = angj + l*nfj*LJC1 + j*LJC1;
-                double *prad = rad_all + (k+l)*LIC1*LJC1;
-                double reg_angi[LIC1];
-                double reg_angj[LJC1];
-                for (int p = 0; p < LIC1; p++){reg_angi[p] = pangi[p];}
-                for (int q = 0; q < LJC1; q++){reg_angj[q] = pangj[q];}
-                for (int p = 0; p < LIC1; p++){
-                for (int q = 0; q < LJC1; q++){
-                    s += prad[p*LJC1+q] * reg_angi[p] * reg_angj[q];
-                }}
+                const double *pangi = angi + k*nfi*LIC1 + i*LIC1;
+                const double *pangj = angj + l*nfj*LJC1 + j*LJC1;
+                const double *prad = rad_all + (k+l)*LIC1*LJC1;
+                for (int p = (LC + k) & 1; p <= k + LC; p += 2){
+                    const double aip = pangi[p];
+                    const double *prad_p = prad + p*LJC1;
+                    for (int q = (LC + l) & 1; q <= l + LC; q += 2){
+                        s += prad_p[q] * aip * pangj[q];
+                    }
+                }
             }}
             reg_gctr[ij/THREADS] += fac*s;
         }
@@ -486,11 +578,14 @@ void type2_cart(double * __restrict__ gctr,
     for (int p = 0; p <= LI+LJ; p++){
         double *prad = rad_all + p*(LI+LC+1)*(LJ+LC+1);
         for (int i = 0; i <= LI+LC; i++){
-        for (int j = 0; j <= LJ+LC; j++){
-            block_reduce(radi[i]*radj[j]*ur, prad+i*(LJ+LC+1)+j);
-        }}
+            const double ri_ur = radi[i] * ur;
+            for (int j = (p + i) & 1; j <= LJ+LC; j += 2){
+                block_reduce_NoSync(ri_ur * radj[j], prad + i*(LJ+LC+1) + j);
+            }
+        }
         ur *= root;
     }
+    __syncthreads();
 
     const int nfi = (LI+1) * (LI+2) / 2;
     const int nfj = (LJ+1) * (LJ+2) / 2;
@@ -515,21 +610,20 @@ void type2_cart(double * __restrict__ gctr,
             const int i = ij%nfi;
             const int j = ij/nfi;
             double s = 0;
+            const int LIC1 = LI+LC+1;
+            const int LJC1 = LJ+LC+1;
             for (int k = 0; k <= LI; k++){
             for (int l = 0; l <= LJ; l++){
-                const int LIC1 = LI+LC+1;
-                const int LJC1 = LJ+LC+1;
-                double *pangi = angi + k*nfi*LIC1 + i*LIC1;
-                double *pangj = angj + l*nfj*LJC1 + j*LJC1;
-                double *prad = rad_all + (k+l)*LIC1*LJC1;
-                double reg_angi[AO_LMAX+ECP_LMAX+1];
-                double reg_angj[AO_LMAX+ECP_LMAX+1];
-                for (int p = 0; p < LIC1; p++){reg_angi[p] = pangi[p];}
-                for (int q = 0; q < LJC1; q++){reg_angj[q] = pangj[q];}
-                for (int p = 0; p < LIC1; p++){
-                for (int q = 0; q < LJC1; q++){
-                    s += prad[p*LJC1+q] * reg_angi[p] * reg_angj[q];
-                }}
+                const double *pangi = angi + k*nfi*LIC1 + i*LIC1;
+                const double *pangj = angj + l*nfj*LJC1 + j*LJC1;
+                const double *prad = rad_all + (k+l)*LIC1*LJC1;
+                for (int p = (LC + k) & 1; p <= k + LC; p += 2){
+                    const double aip = pangi[p];
+                    const double *prad_p = prad + p*LJC1;
+                    for (int q = (LC + l) & 1; q <= l + LC; q += 2){
+                        s += prad_p[q] * aip * pangj[q];
+                    }
+                }
             }}
             reg_gctr[ij/THREADS] += fac*s;
         }

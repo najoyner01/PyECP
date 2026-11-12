@@ -36,6 +36,11 @@ void type1_cart_ipipv(double *gctr,
     const int ecp_id = ecpbas[ECP_ATOM_ID+ecploc[ksh]*BAS_SLOTS];
     gctr += ioff*nao + joff + 9*ecp_id*nao*nao;
 
+    double ur = 0.0;
+    for (int kbas = ecploc[ksh]; kbas < ecploc[ksh+1]; kbas++){
+        ur += rad_part(kbas, ecpbas, env);
+    }
+
     constexpr int nfi2_max = (AO_LMAX+3)*(AO_LMAX+4)/2;
     constexpr int nfj_max = (AO_LMAX+1)*(AO_LMAX+2)/2;
     __shared__ double buf1[nfi2_max*nfj_max];
@@ -43,7 +48,7 @@ void type1_cart_ipipv(double *gctr,
         buf1, LI+2, LJ,
         ish, jsh, ksh,
         ecpbas, ecploc,
-        atm, bas, env);
+        atm, bas, env, ur);
     __syncthreads();
 
     constexpr int nfi1_max = (AO_LMAX+2)*(AO_LMAX+3)/2;
@@ -59,7 +64,7 @@ void type1_cart_ipipv(double *gctr,
         buf1, LI, LJ,
         ish, jsh, ksh,
         ecpbas, ecploc,
-        atm, bas, env);
+        atm, bas, env, ur);
     __syncthreads();
     _li_up(buf, buf1, LI+1, LJ);
     __syncthreads();
@@ -76,7 +81,7 @@ void type1_cart_ipipv(double *gctr,
                 buf1, LI-2, LJ,
                 ish, jsh, ksh,
                 ecpbas, ecploc,
-                atm, bas, env);
+                atm, bas, env, ur);
             __syncthreads();
             _li_up(buf, buf1, LI-1, LJ);
             __syncthreads();
@@ -109,6 +114,11 @@ void type1_cart_ipvip(double *gctr,
     const int ecp_id = ecpbas[ECP_ATOM_ID+ecploc[ksh]*BAS_SLOTS];
     gctr += ioff*nao + joff + 9*ecp_id*nao*nao;
 
+    double ur = 0.0;
+    for (int kbas = ecploc[ksh]; kbas < ecploc[ksh+1]; kbas++){
+        ur += rad_part(kbas, ecpbas, env);
+    }
+
     constexpr int nfi1_max = (AO_LMAX+2)*(AO_LMAX+3)/2;
     constexpr int nfj1_max = (AO_LMAX+2)*(AO_LMAX+3)/2;
     __shared__ double buf1[nfi1_max*nfj1_max];
@@ -116,7 +126,7 @@ void type1_cart_ipvip(double *gctr,
         buf1, LI+1, LJ+1,
         ish, jsh, ksh,
         ecpbas, ecploc,
-        atm, bas, env);
+        atm, bas, env, ur);
     __syncthreads();
 
     constexpr int nfi_max = (AO_LMAX+1)*(AO_LMAX+2)/2;
@@ -132,7 +142,7 @@ void type1_cart_ipvip(double *gctr,
             buf1, LI-1, LJ+1,
             ish, jsh, ksh,
             ecpbas, ecploc,
-            atm, bas, env);
+            atm, bas, env, ur);
         __syncthreads();
         _li_up(buf, buf1, LI, LJ+1);
         __syncthreads();
@@ -149,7 +159,7 @@ void type1_cart_ipvip(double *gctr,
             buf1, LI+1, LJ-1,
             ish, jsh, ksh,
             ecpbas, ecploc,
-            atm, bas, env);
+            atm, bas, env, ur);
         __syncthreads();
         _li_down(buf, buf1, LI, LJ-1);
         __syncthreads();
@@ -158,7 +168,7 @@ void type1_cart_ipvip(double *gctr,
                 buf1, LI-1, LJ-1,
                 ish, jsh, ksh,
                 ecpbas, ecploc,
-                atm, bas, env);
+                atm, bas, env, ur);
             __syncthreads();
             _li_up(buf, buf1, LI, LJ-1);
             __syncthreads();

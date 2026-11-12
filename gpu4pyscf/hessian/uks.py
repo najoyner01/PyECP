@@ -151,8 +151,9 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
         h1mob += h1mob_nlc
 
     grad_obj = hessobj.base.Gradients()
-    h1moa += rhf_grad.get_grad_hcore(grad_obj, mo_a, mo_occ[0])
-    h1mob += rhf_grad.get_grad_hcore(grad_obj, mo_b, mo_occ[1])
+    h1a_hcore, h1b_hcore = rhf_grad.get_grad_hcore(grad_obj, (mo_a, mo_b), (mo_occ[0], mo_occ[1]))
+    h1moa += h1a_hcore
+    h1mob += h1b_hcore
 
     mf = hessobj.base
     ni = mf._numint

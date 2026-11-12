@@ -170,11 +170,8 @@ class GHF(hf.SCF):
         hcore = block_diag(htmp, htmp)
 
         if self.with_soc and mol.has_ecp_soc():
-            # The ECP SOC contribution = <|1j * s * U_SOC|>
-            s = .5 * PauliMatrices
-            ecpso = np.einsum('sxy,spq->xpyq', -1j * s, mol.intor('ECPso'))
-            # Convert to complex array
-            hcore = hcore + asarray(ecpso.reshape(hcore.shape))
+            from gpu4pyscf.gto.ecp import get_soc_1e
+            hcore = hcore + get_soc_1e(mol)
         return hcore
 
     def get_ovlp(self, mol=None):

@@ -31,6 +31,26 @@
 #include "so_ang_matrix.cu"
 #include "ecp_so.cu"
 
+static inline cudaError_t ensure_max_dynamic_smem(
+    const void *func, int *cached_bytes, int *cached_dev, int req_bytes)
+{
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev != *cached_dev) {
+        *cached_dev = dev;
+        *cached_bytes = 0;
+    }
+    if (req_bytes > *cached_bytes) {
+        cudaError_t err = cudaFuncSetAttribute(
+            func, cudaFuncAttributeMaxDynamicSharedMemorySize, req_bytes);
+        if (err != cudaSuccess) {
+            return err;
+        }
+        *cached_bytes = req_bytes;
+    }
+    return cudaSuccess;
+}
+
 extern "C" {
 int ECP_cart(double *gctr,
             const int *ao_loc, const int nao,
@@ -49,20 +69,21 @@ int ECP_cart(double *gctr,
     if (lc >= 0){
         int task_type = li * 100 + lj * 10 + lc;
         switch (task_type) {
-        case 0:  type2_cart<0,0,0><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 1:  type2_cart<0,0,1><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 2:  type2_cart<0,0,2><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 3:  type2_cart<0,0,3><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 10:  type2_cart<0,1,0><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 11:  type2_cart<0,1,1><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 12:  type2_cart<0,1,2><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 110: type2_cart<1,1,0><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 111: type2_cart<1,1,1><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 112: type2_cart<1,1,2><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 20:  type2_cart<0,2,0><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 21:  type2_cart<0,2,1><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 30:  type2_cart<0,3,0><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 120: type2_cart<1,2,0><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
+        #define LAUNCH_T2(LI, LJ, LC) \
+            case ((LI)*100 + (LJ)*10 + (LC)): \
+                type2_cart<LI, LJ, LC><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); \
+                break
+        #define LAUNCH_T2_LC(LI, LJ) \
+            LAUNCH_T2(LI, LJ, 0); LAUNCH_T2(LI, LJ, 1); LAUNCH_T2(LI, LJ, 2); LAUNCH_T2(LI, LJ, 3)
+        #define LAUNCH_T2_LJ(LI) \
+            LAUNCH_T2_LC(LI, 0); LAUNCH_T2_LC(LI, 1); LAUNCH_T2_LC(LI, 2); LAUNCH_T2_LC(LI, 3)
+        LAUNCH_T2_LJ(0);
+        LAUNCH_T2_LJ(1);
+        LAUNCH_T2_LJ(2);
+        LAUNCH_T2_LJ(3);
+        #undef LAUNCH_T2_LJ
+        #undef LAUNCH_T2_LC
+        #undef LAUNCH_T2
 
         // General kernel
         default: {
@@ -83,6 +104,15 @@ int ECP_cart(double *gctr,
             int smem_size4 = lj1*nfj*ljc1; // angj
             int smem_size = smem_size0 + smem_size1 + smem_size2 + smem_size3 + smem_size4;
 
+            static int max_smem_t2 = 0, dev_t2 = -1;
+            void (*t2_gen)(double*, const int, const int, const int, const int*, const int, const int*, const int, const int*, const int*, const int*, const int*, const double*) = type2_cart;
+            cudaError_t attr_err = ensure_max_dynamic_smem(
+                (const void*)t2_gen, &max_smem_t2, &dev_t2, smem_size*sizeof(double));
+            if (attr_err != cudaSuccess) {
+                fprintf(stderr, "CUDA Error in cudaFuncSetAttribute %s (li,lj,lc = %d,%d,%d): %s\n", __func__, li,lj,lc, cudaGetErrorString(attr_err));
+                return 1;
+            }
+
             type2_cart<<<blocks, threads, smem_size*sizeof(double)>>>(
                 gctr,
                 li, lj, lc,
@@ -95,15 +125,19 @@ int ECP_cart(double *gctr,
         int task_type = li * 10 + lj;
         switch (task_type)
         {
-        case 0:  type1_cart<0,0><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 1:  type1_cart<0,1><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 11: type1_cart<1,1><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 2:  type1_cart<0,2><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 3:  type1_cart<0,3><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 12: type1_cart<1,2><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 4:  type1_cart<0,4><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 13: type1_cart<1,3><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 22: type1_cart<2,2><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
+        #define LAUNCH_T1(LI, LJ) \
+            case ((LI)*10 + (LJ)): \
+                type1_cart<LI, LJ><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); \
+                break
+        #define LAUNCH_T1_LJ(LI) \
+            LAUNCH_T1(LI, 0); LAUNCH_T1(LI, 1); LAUNCH_T1(LI, 2); LAUNCH_T1(LI, 3); LAUNCH_T1(LI, 4)
+        LAUNCH_T1_LJ(0);
+        LAUNCH_T1_LJ(1);
+        LAUNCH_T1_LJ(2);
+        LAUNCH_T1_LJ(3);
+        LAUNCH_T1_LJ(4);
+        #undef LAUNCH_T1_LJ
+        #undef LAUNCH_T1
         default: {
             const int lij1 = li+lj+1;
             const int lij3 = lij1*lij1*lij1;
@@ -145,15 +179,19 @@ int ECP_ip_cart(double *gctr,
     if (lc < 0){
         int task_type = li * 10 + lj;
         switch (task_type) {
-        case 0:  type1_cart_ip1<0,0><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 1:  type1_cart_ip1<0,1><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 11: type1_cart_ip1<1,1><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 2:  type1_cart_ip1<0,2><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 3:  type1_cart_ip1<0,3><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 12: type1_cart_ip1<1,2><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 4:  type1_cart_ip1<0,4><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 13: type1_cart_ip1<1,3><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 22: type1_cart_ip1<2,2><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
+        #define LAUNCH_T1_IP1(LI, LJ) \
+            case ((LI)*10 + (LJ)): \
+                type1_cart_ip1<LI, LJ><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); \
+                break
+        #define LAUNCH_T1_IP1_LJ(LI) \
+            LAUNCH_T1_IP1(LI, 0); LAUNCH_T1_IP1(LI, 1); LAUNCH_T1_IP1(LI, 2); LAUNCH_T1_IP1(LI, 3); LAUNCH_T1_IP1(LI, 4)
+        LAUNCH_T1_IP1_LJ(0);
+        LAUNCH_T1_IP1_LJ(1);
+        LAUNCH_T1_IP1_LJ(2);
+        LAUNCH_T1_IP1_LJ(3);
+        LAUNCH_T1_IP1_LJ(4);
+        #undef LAUNCH_T1_IP1_LJ
+        #undef LAUNCH_T1_IP1
         default: {
             const int lij1 = li+lj+2;
             const int lij3 = lij1*lij1*lij1;
@@ -171,20 +209,21 @@ int ECP_ip_cart(double *gctr,
     } else {
         int task_type = li * 100 + lj * 10 + lc;
         switch (task_type) {
-        case 0:  type2_cart_ip1<0,0,0><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 1:  type2_cart_ip1<0,0,1><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 2:  type2_cart_ip1<0,0,2><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 3:  type2_cart_ip1<0,0,3><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 10:  type2_cart_ip1<0,1,0><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 11:  type2_cart_ip1<0,1,1><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 12:  type2_cart_ip1<0,1,2><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 110: type2_cart_ip1<1,1,0><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 111: type2_cart_ip1<1,1,1><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 112: type2_cart_ip1<1,1,2><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 20:  type2_cart_ip1<0,2,0><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 21:  type2_cart_ip1<0,2,1><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 30:  type2_cart_ip1<0,3,0><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
-        case 120: type2_cart_ip1<1,2,0><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); break;
+        #define LAUNCH_T2_IP1(LI, LJ, LC) \
+            case ((LI)*100 + (LJ)*10 + (LC)): \
+                type2_cart_ip1<LI, LJ, LC><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); \
+                break
+        #define LAUNCH_T2_IP1_LC(LI, LJ) \
+            LAUNCH_T2_IP1(LI, LJ, 0); LAUNCH_T2_IP1(LI, LJ, 1); LAUNCH_T2_IP1(LI, LJ, 2); LAUNCH_T2_IP1(LI, LJ, 3)
+        #define LAUNCH_T2_IP1_LJ(LI) \
+            LAUNCH_T2_IP1_LC(LI, 0); LAUNCH_T2_IP1_LC(LI, 1); LAUNCH_T2_IP1_LC(LI, 2); LAUNCH_T2_IP1_LC(LI, 3)
+        LAUNCH_T2_IP1_LJ(0);
+        LAUNCH_T2_IP1_LJ(1);
+        LAUNCH_T2_IP1_LJ(2);
+        LAUNCH_T2_IP1_LJ(3);
+        #undef LAUNCH_T2_IP1_LJ
+        #undef LAUNCH_T2_IP1_LC
+        #undef LAUNCH_T2_IP1
 
         // General kernel
         default: {
@@ -206,9 +245,10 @@ int ECP_ip_cart(double *gctr,
             int smem_size4 = lj1*ljc1*nfj; // angj
 
             int dynamic_smem_size = smem_size0 + smem_size1 + smem_size2 + smem_size3 + smem_size4;
-            cudaError_t err = cudaFuncSetAttribute(
-                type2_cart_ip1_general,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static int max_smem_ip1 = 0, dev_ip1 = -1;
+            cudaError_t err = ensure_max_dynamic_smem(
+                (const void*)type2_cart_ip1_general,
+                &max_smem_ip1, &dev_ip1,
                 dynamic_smem_size*sizeof(double));
 
             if (err != cudaSuccess) {
@@ -279,17 +319,16 @@ int ECP_ipipv_cart(double *gctr,
         int smem_size3 = li1*lic1*nfi; // angi
         int smem_size4 = lj1*ljc1*nfj; // angj
 
-        //int NF2_MAX = (AO_LMAX+3)*(AO_LMAX+4)/2;
         int NF1_MAX = (AO_LMAX+2)*(AO_LMAX+3)/2;
         int NF0_MAX = (AO_LMAX+1)*(AO_LMAX+2)/2;
-        //int static_smem_size = NF2_MAX*NF0_MAX;
         int dynamic_smem_size = smem_size0 + smem_size1 + smem_size2 + smem_size3 + smem_size4;
         dynamic_smem_size = max(dynamic_smem_size, 3*NF1_MAX*NF0_MAX);
-        //int total_smem_size = static_smem_size + dynamic_smem_size;
 
-        cudaError_t err = cudaFuncSetAttribute(type2_cart_ipipv,
-                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                         dynamic_smem_size*sizeof(double));
+        static int max_smem_ipipv = 0, dev_ipipv = -1;
+        cudaError_t err = ensure_max_dynamic_smem(
+            (const void*)type2_cart_ipipv,
+            &max_smem_ipipv, &dev_ipipv,
+            dynamic_smem_size*sizeof(double));
         if (err != cudaSuccess) {
             fprintf(stderr, "CUDA Error in cudaFuncSetAttribute %s (li,lj,lc = %d,%d,%d): %s\n", __func__, li,lj,lc, cudaGetErrorString(err));
             return 1;
@@ -359,14 +398,13 @@ int ECP_ipvip_cart(double *gctr,
 
         int NF1_MAX = (AO_LMAX+2)*(AO_LMAX+3)/2;
         int NF0_MAX = (AO_LMAX+1)*(AO_LMAX+2)/2;
-        //int static_smem_size = NF1_MAX*NF1_MAX;
         int dynamic_smem_size = smem_size0 + smem_size1 + smem_size2 + smem_size3 + smem_size4;
         dynamic_smem_size = max(dynamic_smem_size, 3*NF0_MAX*NF1_MAX);
 
-        //int total_smem_size = static_smem_size + dynamic_smem_size;
-        cudaError_t err = cudaFuncSetAttribute(
-            type2_cart_ipvip,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static int max_smem_ipvip = 0, dev_ipvip = -1;
+        cudaError_t err = ensure_max_dynamic_smem(
+            (const void*)type2_cart_ipvip,
+            &max_smem_ipvip, &dev_ipvip,
             dynamic_smem_size*sizeof(double));
         if (err != cudaSuccess) {
             fprintf(stderr, "CUDA Error in cudaFuncSetAttribute %s (li,lj,lc = %d,%d,%d): %s\n", __func__, li,lj,lc, cudaGetErrorString(err));
@@ -399,7 +437,7 @@ int ECP_so_cart(double *gctr,
     // rewritten to max_l(atom)+1, so lc >= 0 always here.
     // Screening can empty a task group; a 0-block launch is not a legal
     // configuration, so treat it as a no-op.
-    if (ntasks == 0){
+    if (ntasks == 0 || lc == 0){
         return 0;
     }
     dim3 threads(THREADS);
@@ -411,38 +449,58 @@ int ECP_so_cart(double *gctr,
         return 1;
     }
 
-    const int li1 = li+1;
-    const int lj1 = lj+1;
-    const int nfi = (li+1)*(li+2)/2;
-    const int nfj = (lj+1)*(lj+2)/2;
-    const int lic1 = li+lc+1;
-    const int ljc1 = lj+lc+1;
-    const int lcc1 = 2*lc+1;
-    const int blki = (lic1+1)/2 * lcc1;
-    const int blkj = (ljc1+1)/2 * lcc1;
+    int task_type = li * 100 + lj * 10 + lc;
+    switch (task_type) {
+    #define LAUNCH_SO(LI, LJ, LC) \
+        case ((LI)*100 + (LJ)*10 + (LC)): \
+            so_cart<LI, LJ, LC><<<blocks, threads>>>(gctr, ao_loc, nao, tasks, ntasks, ecpbas, ecploc, atm, bas, env); \
+            break
+    #define LAUNCH_SO_LC(LI, LJ) \
+        LAUNCH_SO(LI, LJ, 1); LAUNCH_SO(LI, LJ, 2); LAUNCH_SO(LI, LJ, 3)
+    #define LAUNCH_SO_LJ(LI) \
+        LAUNCH_SO_LC(LI, 0); LAUNCH_SO_LC(LI, 1); LAUNCH_SO_LC(LI, 2)
+    LAUNCH_SO_LJ(0);
+    LAUNCH_SO_LJ(1);
+    LAUNCH_SO_LJ(2);
+    #undef LAUNCH_SO_LJ
+    #undef LAUNCH_SO_LC
+    #undef LAUNCH_SO
 
-    int smem_size0 = (li+lj+1) * lic1 * ljc1;         // rad_all
-    int smem_size1 = li1*(li1+1)*(li1+2)/6 * blki;    // omegai
-    int smem_size2 = lj1*(lj1+1)*(lj1+2)/6 * blkj;    // omegaj (and omegaj_a)
-    int smem_size3 = li1*nfi*lic1;                    // angi
-    int smem_size4 = lj1*nfj*ljc1;                    // angj
-    int smem_size = smem_size0 + smem_size1 + 2*smem_size2 + smem_size3 + smem_size4;
+    default: {
+        const int li1 = li+1;
+        const int lj1 = lj+1;
+        const int nfi = (li+1)*(li+2)/2;
+        const int nfj = (lj+1)*(lj+2)/2;
+        const int lic1 = li+lc+1;
+        const int ljc1 = lj+lc+1;
+        const int lcc1 = 2*lc+1;
+        const int blki = (lic1+1)/2 * lcc1;
+        const int blkj = (ljc1+1)/2 * lcc1;
 
-    cudaError_t attr_err = cudaFuncSetAttribute(
-        so_cart, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        smem_size*sizeof(double));
-    if (attr_err != cudaSuccess) {
-        fprintf(stderr, "CUDA Error in cudaFuncSetAttribute %s (li,lj,lc = %d,%d,%d): %s\n",
-                __func__, li, lj, lc, cudaGetErrorString(attr_err));
-        return 1;
-    }
+        int smem_size0 = (li+lj+1) * lic1 * ljc1;         // rad_all
+        int smem_size1 = li1*(li1+1)*(li1+2)/6 * blki;    // omegai
+        int smem_size2 = lj1*(lj1+1)*(lj1+2)/6 * blkj;    // omegaj (and omegaj_a)
+        int smem_size3 = li1*nfi*lic1;                    // angi
+        int smem_size4 = lj1*nfj*ljc1;                    // angj
+        int smem_size = smem_size0 + smem_size1 + 2*smem_size2 + smem_size3 + smem_size4;
 
-    so_cart<<<blocks, threads, smem_size*sizeof(double)>>>(
-        gctr, li, lj, lc,
-        ao_loc, nao,
-        tasks, ntasks,
-        ecpbas, ecploc,
-        atm, bas, env);
+        static int max_smem_so = 0, dev_so = -1;
+        void (*so_gen)(double*, const int, const int, const int, const int*, const int, const int*, const int, const int*, const int*, const int*, const int*, const double*) = so_cart;
+        cudaError_t attr_err = ensure_max_dynamic_smem(
+            (const void*)so_gen, &max_smem_so, &dev_so, smem_size*sizeof(double));
+        if (attr_err != cudaSuccess) {
+            fprintf(stderr, "CUDA Error in cudaFuncSetAttribute %s (li,lj,lc = %d,%d,%d): %s\n",
+                    __func__, li, lj, lc, cudaGetErrorString(attr_err));
+            return 1;
+        }
+
+        so_cart<<<blocks, threads, smem_size*sizeof(double)>>>(
+            gctr, li, lj, lc,
+            ao_loc, nao,
+            tasks, ntasks,
+            ecpbas, ecploc,
+            atm, bas, env);
+    }}
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {

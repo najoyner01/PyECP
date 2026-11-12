@@ -362,11 +362,11 @@ def get_nacv_multi(td_nac, x_list, y_list, E_list, singlet=True, ge_targets=None
 
     dh1e_td_list = []
     for k in range(total_tasks):
-        dh1e_k = int3c2e.get_dh1e(mol, P_all[k])
-        if len(mol._ecpbas) > 0:
-            dh1e_k += rhf_grad.get_dh1e_ecp(mol, P_all[k])
-        dh1e_td_list.append(dh1e_k)
+        dh1e_td_list.append(int3c2e.get_dh1e(mol, P_all[k]))
     dh1e_td_all = cp.array(dh1e_td_list)
+    if len(mol._ecpbas) > 0:
+        # all state density matrices in ONE pass over the ECP derivative kernels
+        dh1e_td_all += rhf_grad.get_dh1e_ecp(mol, P_all[:total_tasks])
 
     dms_tasks, j_factor, k_factor = [], [], []
 

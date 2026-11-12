@@ -116,35 +116,26 @@ void cache_fac(double *fx, double *ri){
     }
 }
 
-__device__
+__device__ __forceinline__
+double warp_reduce_sum(double val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xffffffffu, val, offset);
+    }
+    return val;
+}
+
+__device__ __forceinline__
+void block_reduce_NoSync(double val, double *d_out) {
+    val = warp_reduce_sum(val);
+    if ((threadIdx.x & 31) == 0 && val != 0.0) {
+        atomicAdd(d_out, val);
+    }
+}
+
+__device__ __forceinline__
 void block_reduce(double val, double *d_out) {
-    __shared__ double sdata[THREADS];
-    const unsigned int tid = threadIdx.x;
-
-    sdata[tid] = val;
-    __syncthreads();
-
-    // Perform reduction in shared memory.
-    // Reduce the data until one warp remains. warpSize is a built-in
-    // device constant (32 on NVIDIA today; portable for future targets).
-    for (unsigned int s = THREADS / 2; s >= warpSize; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
-        }
-        __syncthreads();
-    }
-
-    if (tid < warpSize) {
-        double value = sdata[tid]; // load to register
-        unsigned int mask = __activemask(); // all lanes in warp 0 are active
-        // Final intra-warp reduction; stride starts at warpSize/2.
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-            value += __shfl_down_sync(mask, value, offset);
-        }
-        if (tid == 0) {
-            d_out[0] += value;
-        }
-    }
+    block_reduce_NoSync(val, d_out);
     __syncthreads();
 }
 

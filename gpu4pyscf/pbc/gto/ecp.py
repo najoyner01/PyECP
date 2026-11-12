@@ -40,7 +40,8 @@ from pyscf import gto, lib
 from gpu4pyscf.lib.cupy_helper import contract, get_avail_mem
 from gpu4pyscf.gto.ecp import (
     libecp, sort_ecp_basis, sort_ecp_basis_so,
-    _build_screen_data, _screen_block, _ecp_expcutoff, ECP_ATOM_ID,
+    _build_screen_data, _screen_block, _unscreened_block_columns,
+    _collapse_l_groups, _ecp_expcutoff, ECP_ATOM_ID,
 )
 from gpu4pyscf.gto import ecp as _mol_ecp
 from gpu4pyscf.gto.mole import group_basis
@@ -167,6 +168,7 @@ def _lattice_ecp_cart(cell, intor):
     nL = len(Ls)
 
     sorted_mol, coeff, uniq_l_ctr, l_ctr_counts = group_basis(cell)
+    uniq_l_ctr, l_ctr_counts = _collapse_l_groups(uniq_l_ctr, l_ctr_counts)
     l_ctr_offsets = np.append(0, np.cumsum(l_ctr_counts))
     n_groups = len(uniq_l_ctr)
     nbas_ref = sorted_mol.nbas
@@ -212,41 +214,68 @@ def _lattice_ecp_cart(cell, intor):
 
         mat1 = cp.zeros([comp, nao_sup, nao_sup])
 
+        flat_segments = []
+        launch_specs = []
+        off_ints = 0
+        ksh_sups = [
+            np.concatenate([
+                m * n_ref_ecp_groups + np.arange(
+                    lecp_offsets[k], lecp_offsets[k + 1], dtype=np.int32)
+                for m in range(nL)])
+            for k in range(n_ecp_l_types)
+        ]
+
         for i in range(n_groups):
             li = int(uniq_l_ctr[i, 0])
-            ish_range = np.arange(l_ctr_offsets[i], l_ctr_offsets[i + 1])
+            ish_range = np.arange(
+                l_ctr_offsets[i], l_ctr_offsets[i + 1], dtype=np.int32)
             for j in range(n_groups):
                 lj = int(uniq_l_ctr[j, 0])
                 # batch ket shells of type j across the batch images
                 jsh_range = np.concatenate([
                     np.arange(nbas_ref * (b + 1) + l_ctr_offsets[j],
-                              nbas_ref * (b + 1) + l_ctr_offsets[j + 1])
+                              nbas_ref * (b + 1) + l_ctr_offsets[j + 1],
+                              dtype=np.int32)
                     for b in range(nket)])
                 for k in range(n_ecp_l_types):
                     lk = int(uniq_lecp[k])
-                    ksh_ref = np.arange(lecp_offsets[k], lecp_offsets[k + 1])
-                    ksh_sup = np.concatenate([
-                        m * n_ref_ecp_groups + ksh_ref for m in range(nL)])
+                    ksh_sup = ksh_sups[k]
                     if do_screen:
-                        task = _screen_block(ish_range, jsh_range, ksh_sup,
-                                             screen_data, expcutoff,
-                                             triangular=False)
+                        cols = _screen_block(
+                            ish_range, jsh_range, ksh_sup,
+                            screen_data, expcutoff,
+                            triangular=False, return_columns=True)
+                        if not cols:
+                            continue
+                        if len(cols) == 1:
+                            ii, jj, kk = cols[0]
+                        else:
+                            ii = np.concatenate([c[0] for c in cols])
+                            jj = np.concatenate([c[1] for c in cols])
+                            kk = np.concatenate([c[2] for c in cols])
                     else:
-                        gi, gj, gk = np.meshgrid(ish_range, jsh_range, ksh_sup,
-                                                 indexing='ij')
-                        task = np.stack([gi.ravel(), gj.ravel(), gk.ravel()],
-                                        axis=1).astype(np.int64)
-                    if len(task) == 0:
-                        continue
-                    task_g = cp.asarray(task, dtype=np.int32, order='F')
-                    err = kernel(
-                        mat1.data.ptr, ao_loc_g.data.ptr, nao_sup,
-                        task_g.data.ptr, len(task),
-                        ecpbas_g.data.ptr, ecploc_g.data.ptr,
-                        atm_g.data.ptr, bas_g.data.ptr, env_g.data.ptr,
-                        li, lj, lk)
-                    if err != 0:
-                        raise RuntimeError(f'PBC {intor} CUDA kernel failed.')
+                        ii, jj, kk = _unscreened_block_columns(
+                            ish_range, jsh_range, ksh_sup, triangular=False)
+                        if ii.size == 0:
+                            continue
+                    ntasks = int(ii.size)
+                    flat_segments.extend((ii, jj, kk))
+                    launch_specs.append((off_ints, ntasks, li, lj, lk))
+                    off_ints += 3 * ntasks
+
+        if launch_specs:
+            tasks_flat_g = cp.asarray(
+                np.concatenate(flat_segments), dtype=np.int32)
+            base_ptr = tasks_flat_g.data.ptr
+            for off_ints, ntasks, li, lj, lk in launch_specs:
+                err = kernel(
+                    mat1.data.ptr, ao_loc_g.data.ptr, nao_sup,
+                    base_ptr + off_ints * 4, ntasks,
+                    ecpbas_g.data.ptr, ecploc_g.data.ptr,
+                    atm_g.data.ptr, bas_g.data.ptr, env_g.data.ptr,
+                    li, lj, lk)
+                if err != 0:
+                    raise RuntimeError(f'PBC {intor} CUDA kernel failed.')
 
         # bra x ket block -> [comp, nao_ref_cart, nket, nao_ref_cart]
         sub = mat1[:, :nao_ref_cart, nao_ref_cart:].reshape(

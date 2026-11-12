@@ -189,16 +189,29 @@ def _ejk_quartets_scheme(mol, l_ctr_pattern, shm_size=SHM_SIZE):
 
 def get_dh1e_ecp(mol, dm):
     '''
-    Nuclear gradients of core Hamiltonian due to ECP
+    Nuclear gradients of core Hamiltonian due to ECP.
+
+    Args:
+        dm: [nao, nao] or a stack [ndm, nao, nao].  Several density matrices
+            are contracted in ONE pass over the ECP derivative integrals.
+    Returns:
+        [natm, 3] (or [ndm, natm, 3]) -- rows of non-ECP atoms are zero.
     '''
     with_ecp = len(mol._ecpbas) > 0
     if not with_ecp:
         raise RuntimeWarning("ECP not found")
 
     dm = cupy.asarray(dm)
-    parts = [contract('nxij,ij->nx', h1, dm)
-             for _batch, h1 in loop_ecp_ip(mol)]
-    return 2.0 * cupy.concatenate(parts, axis=0)
+    single = dm.ndim == 2
+    dms = dm[None] if single else dm.reshape(-1, dm.shape[-2], dm.shape[-1])
+    natm = mol.natm
+    out = cupy.zeros([dms.shape[0], natm, 3])
+    for batch, h1 in loop_ecp_ip(mol):
+        out[:, np.asarray(batch)] = contract('nxij,dij->dnx', h1, dms)
+    out *= 2.0
+    if single:
+        return out[0]
+    return out.reshape(dm.shape[:-2] + (natm, 3))
 
 def get_hcore(mf, mol, exclude_ecp=False):
     '''
@@ -357,6 +370,11 @@ def _hcore_energy(mf_grad, dm0, dme0):
 def get_grad_hcore(mf_grad, mo_coeff=None, mo_occ=None):
     '''
     Calculate derivatives of Hcore in MO bases
+
+    ``mo_coeff``/``mo_occ`` may be a single (closed-shell) set or a tuple/list
+    of spin blocks ``(mo_a, mo_b)`` / ``(occ_a, occ_b)``.  In the latter case
+    every AO-basis derivative integral (int1e, 1/r 3-centre and ECP) is
+    evaluated ONCE and contracted with each spin block; a tuple is returned.
     '''
     mf = mf_grad.base
     mol = mf.mol
@@ -364,21 +382,28 @@ def get_grad_hcore(mf_grad, mo_coeff=None, mo_occ=None):
     if mo_coeff is None: mo_coeff = cupy.asarray(mf.mo_coeff)
     if mo_occ is None: mo_occ = mf.mo_occ
 
-    if getattr(mf, 'with_x2c', None):
-        raise NotImplementedError('X2C gradients')
+    if mol._pseudo:
+        raise NotImplementedError("Pseudopotential gradient not supported for molecular system yet")
 
-    orbo = mo_coeff[:,mo_occ>0]
-    nmo = mo_coeff.shape[1]
-    nocc = orbo.shape[1]
-    dh1e = cupy.empty([natm,3,nmo,nocc])
+    multi = isinstance(mo_coeff, (tuple, list))
+    if multi:
+        mo_list = [cupy.asarray(c) for c in mo_coeff]
+        occ_list = list(mo_occ)
+    else:
+        mo_list = [cupy.asarray(mo_coeff)]
+        occ_list = [mo_occ]
+    nset = len(mo_list)
+    orbo_list = [c[:, o > 0] for c, o in zip(mo_list, occ_list)]
+    dh1e_list = [cupy.empty([natm, 3, c.shape[1], orbo.shape[1]])
+                 for c, orbo in zip(mo_list, orbo_list)]
 
     # derivative w.r.t nuclie position
     coords = mol.atom_coords()
     charges = cupy.asarray(mol.atom_charges(), dtype=np.float64)
     fakemol = gto.fakemol_for_charges(coords)
     sorted_mol = SortedMole.from_mol(mol, decontract=True)
-    mo_sorted = sorted_mol.apply_C_dot(mo_coeff, axis=0)
-    orbo_sorted = mo_sorted[:,mo_occ>0]
+    mo_sorted_list = [sorted_mol.apply_C_dot(c, axis=0) for c in mo_list]
+    orbo_sorted_list = [m[:, o > 0] for m, o in zip(mo_sorted_list, occ_list)]
 
     opt = Int3c2eOpt(sorted_mol, fakemol).build(tril=False)
     batch_size = min(32, natm)
@@ -394,33 +419,41 @@ def get_grad_hcore(mf_grad, mo_coeff=None, mo_occ=None):
         h1 = work[:p1-p0]
         h1[:,:,pair_addresses] = tmp.transpose(2,0,1)
         h1 = transpose_sum(h1.reshape((p1-p0)*3, nao1, nao1))
-        tmp = contract('kxpq,qj->kxpj', h1.reshape(p1-p0,3,nao1,nao1), orbo_sorted)
-        contract('kxpj,pi->kxij', tmp, mo_sorted, out=dh1e[p0:p1])
+        h1 = h1.reshape(p1-p0,3,nao1,nao1)
+        for s_ in range(nset):
+            tmp = contract('kxpq,qj->kxpj', h1, orbo_sorted_list[s_])
+            contract('kxpj,pi->kxij', tmp, mo_sorted_list[s_], out=dh1e_list[s_][p0:p1])
     work = h1 = tmp = None
 
-    # derivative w.r.t. atomic orbitals
-    h1 = cupy.asarray(mf_grad.get_hcore(mol))
+    # derivative w.r.t. atomic orbitals.  The ECP part of get_hcore is
+    # excluded here and folded in below from the SAME loop_ecp_ip pass that
+    # provides the per-ECP-atom blocks (one kernel pass instead of two).
+    h1 = cupy.asarray(mf_grad.get_hcore(mol, exclude_ecp=True))
     aoslices = mol.aoslice_by_atom()
-
-    for atm_id in range(natm):
-        p0, p1 = aoslices[atm_id][2:]
-        h1mo = contract('xij,jo->xio', h1[:,p0:p1], orbo)
-        dh1e[atm_id] += contract('xio,ip->xpo', h1mo, mo_coeff[p0:p1])
-        h1mo = contract('xij,jp->xpi', h1[:,p0:p1], mo_coeff)
-        dh1e[atm_id] += contract('xpi,io->xpo', h1mo, orbo[p0:p1])
 
     # Contributions due to ECP
     if len(mol._ecpbas) > 0:
         ecp_atoms = np.unique(mol._ecpbas[:,gto.ATOM_OF])
         for batch, h1_ecp in loop_ecp_ip(mol, ecp_atoms=ecp_atoms):
+            h1 -= h1_ecp.sum(axis=0)
             h1_ecp = h1_ecp + h1_ecp.transpose([0,1,3,2])
-            h1mo = contract('nxij,jo->nxio', h1_ecp, orbo)
-            dh1e[np.asarray(batch)] += contract('nxio,ip->nxpo', h1mo, mo_coeff)
+            for s_ in range(nset):
+                h1mo = contract('nxij,jo->nxio', h1_ecp, orbo_list[s_])
+                dh1e_list[s_][np.asarray(batch)] += contract('nxio,ip->nxpo', h1mo, mo_list[s_])
 
-    if mol._pseudo:
-        raise NotImplementedError("Pseudopotential gradient not supported for molecular system yet")
+    for atm_id in range(natm):
+        p0, p1 = aoslices[atm_id][2:]
+        for s_ in range(nset):
+            mo_coeff_s = mo_list[s_]
+            orbo = orbo_list[s_]
+            h1mo = contract('xij,jo->xio', h1[:,p0:p1], orbo)
+            dh1e_list[s_][atm_id] += contract('xio,ip->xpo', h1mo, mo_coeff_s[p0:p1])
+            h1mo = contract('xij,jp->xpi', h1[:,p0:p1], mo_coeff_s)
+            dh1e_list[s_][atm_id] += contract('xpi,io->xpo', h1mo, orbo[p0:p1])
 
-    return dh1e
+    if multi:
+        return tuple(dh1e_list)
+    return dh1e_list[0]
 
 def contract_h1e_dm(mol, h1e, dm, hermi=0):
     '''Evaluate

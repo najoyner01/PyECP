@@ -145,9 +145,11 @@ void so_cart(double * __restrict__ gctr,
     for (int p = 0; p <= LI+LJ; p++){
         double *prad = rad_all + p*LIC1*LJC1;
         for (int i = 0; i <= LI+LC; i++){
-        for (int j = 0; j <= LJ+LC; j++){
-            block_reduce(radi[i]*radj[j]*ur, prad+i*LJC1+j);
-        }}
+            const double ri_ur = radi[i] * ur;
+            for (int j = (p + i) & 1; j <= LJ+LC; j += 2){
+                block_reduce_NoSync(ri_ur * radj[j], prad + i*LJC1 + j);
+            }
+        }
         ur *= root;
     }
     __syncthreads();
@@ -180,17 +182,16 @@ void so_cart(double * __restrict__ gctr,
                 double s = 0.0;
                 for (int k = 0; k <= LI; k++){
                 for (int l = 0; l <= LJ; l++){
-                    double *pangi = angi + k*nfi*LIC1 + i*LIC1;
-                    double *pangj = angj + l*nfj*LJC1 + j*LJC1;
-                    double *prad  = rad_all + (k+l)*LIC1*LJC1;
-                    double reg_angi[AO_LMAX+ECP_LMAX+1];
-                    double reg_angj[AO_LMAX+ECP_LMAX+1];
-                    for (int p = 0; p < LIC1; p++){ reg_angi[p] = pangi[p]; }
-                    for (int q = 0; q < LJC1; q++){ reg_angj[q] = pangj[q]; }
-                    for (int p = 0; p < LIC1; p++){
-                    for (int q = 0; q < LJC1; q++){
-                        s += prad[p*LJC1+q] * reg_angi[p] * reg_angj[q];
-                    }}
+                    const double *pangi = angi + k*nfi*LIC1 + i*LIC1;
+                    const double *pangj = angj + l*nfj*LJC1 + j*LJC1;
+                    const double *prad  = rad_all + (k+l)*LIC1*LJC1;
+                    for (int p = (LC + k) & 1; p <= k + LC; p += 2){
+                        const double aip = pangi[p];
+                        const double *prad_p = prad + p*LJC1;
+                        for (int q = (LC + l) & 1; q <= l + LC; q += 2){
+                            s += prad_p[q] * aip * pangj[q];
+                        }
+                    }
                 }}
                 reg_gctr[ij/THREADS] += fac * s;
             }
@@ -198,6 +199,150 @@ void so_cart(double * __restrict__ gctr,
         }
 
         // gctr[a, bra=i, ket=j] (row-major); transpose block gets -1 (antisym).
+        double *g = gctr + (size_t)a * nao * nao;
+        for (int ij = threadIdx.x; ij < nfi*nfj; ij += blockDim.x){
+            const int i = ij % nfi;
+            const int j = ij / nfi;
+            const double tmp = reg_gctr[ij/THREADS];
+            atomicAdd(g + (size_t)(i+ioff)*nao + (j+joff), tmp);
+            if (ish != jsh){
+                atomicAdd(g + (size_t)(j+joff)*nao + (i+ioff), -tmp);
+            }
+        }
+        __syncthreads();
+    }
+    return;
+}
+
+template <int LI, int LJ, int LC> __global__
+void so_cart(double * __restrict__ gctr,
+             const int *ao_loc, const int nao,
+             const int *tasks, const int ntasks,
+             const int *ecpbas, const int *ecploc,
+             const int *atm, const int *bas, const double *env)
+{
+    const int task_id = blockIdx.x;
+    if (task_id >= ntasks || LC < 1){
+        return;
+    }
+
+    const int ish = tasks[task_id];
+    const int jsh = tasks[task_id + ntasks];
+    const int ksh = tasks[task_id + 2*ntasks];
+
+    const double *ri = env + atm[PTR_COORD+bas[ATOM_OF+ish*BAS_SLOTS]*ATM_SLOTS];
+    const double *rj = env + atm[PTR_COORD+bas[ATOM_OF+jsh*BAS_SLOTS]*ATM_SLOTS];
+    const int atm_id = ecpbas[ATOM_OF+ecploc[ksh]*BAS_SLOTS];
+    const double *rc = env + atm[PTR_COORD+atm_id*ATM_SLOTS];
+
+    double ur = 0.0;
+    for (int kbas = ecploc[ksh]; kbas < ecploc[ksh+1]; kbas++){
+        ur += rad_part(kbas, ecpbas, env);
+    }
+
+    double rca[3], rcb[3];
+    rca[0] = rc[0] - ri[0];
+    rca[1] = rc[1] - ri[1];
+    rca[2] = rc[2] - ri[2];
+    rcb[0] = rc[0] - rj[0];
+    rcb[1] = rc[1] - rj[1];
+    rcb[2] = rc[2] - rj[2];
+
+    constexpr int LI1 = LI + 1;
+    constexpr int LJ1 = LJ + 1;
+    constexpr int LIC1 = LI + LC + 1;
+    constexpr int LJC1 = LJ + LC + 1;
+    constexpr int LCC1 = 2 * LC + 1;
+    constexpr int nfi = (LI+1) * (LI+2) / 2;
+    constexpr int nfj = (LJ+1) * (LJ+2) / 2;
+    constexpr int BLKI = (LIC1+1)/2 * LCC1;
+    constexpr int omegaj_rows = (LJC1+1)/2 * (LJ1*(LJ1+1)*(LJ1+2)/6);
+    constexpr int BLKJ = (LJC1+1)/2 * LCC1;
+
+    __shared__ double rad_all[(LI+LJ+1) * LIC1 * LJC1];
+    __shared__ double omegai[LI1*(LI1+1)*(LI1+2)/6 * BLKI];
+    __shared__ double omegaj[LJ1*(LJ1+1)*(LJ1+2)/6 * BLKJ];
+    __shared__ double omegaj_a[LJ1*(LJ1+1)*(LJ1+2)/6 * BLKJ];
+    __shared__ double angi[LI1*nfi*LIC1];
+    __shared__ double angj[LJ1*nfj*LJC1];
+
+    type2_facs_omega<LI, LC>(omegai, rca);
+    type2_facs_omega<LJ, LC>(omegaj, rcb);
+    __syncthreads();
+
+    const int npi = bas[NPRIM_OF+ish*BAS_SLOTS];
+    const int npj = bas[NPRIM_OF+jsh*BAS_SLOTS];
+    const double *ai = env + bas[PTR_EXP+ish*BAS_SLOTS];
+    const double *aj = env + bas[PTR_EXP+jsh*BAS_SLOTS];
+    const double *ci = env + bas[PTR_COEFF+ish*BAS_SLOTS];
+    const double *cj = env + bas[PTR_COEFF+jsh*BAS_SLOTS];
+
+    double radi[LIC1];
+    const double dca = norm3d(rca[0], rca[1], rca[2]);
+    type2_facs_rad<0>(radi, LI+LC, npi, dca, ci, ai);
+
+    double radj[LJC1];
+    const double dcb = norm3d(rcb[0], rcb[1], rcb[2]);
+    type2_facs_rad<0>(radj, LJ+LC, npj, dcb, cj, aj);
+
+    double root = 0.0;
+    if (threadIdx.x < NGAUSS){
+        root = r128[threadIdx.x];
+    }
+    set_shared_memory(rad_all, (LI+LJ+1)*LIC1*LJC1);
+    for (int p = 0; p <= LI+LJ; p++){
+        double *prad = rad_all + p*LIC1*LJC1;
+        for (int i = 0; i <= LI+LC; i++){
+            const double ri_ur = radi[i] * ur;
+            for (int j = (p + i) & 1; j <= LJ+LC; j += 2){
+                block_reduce_NoSync(ri_ur * radj[j], prad + i*LJC1 + j);
+            }
+        }
+        ur *= root;
+    }
+    __syncthreads();
+
+    const double fac = 16.0 * M_PI * M_PI * _common_fac[LI] * _common_fac[LJ];
+    constexpr int nreg = (nfi*nfj + THREADS - 1)/THREADS;
+    const int ioff = ao_loc[ish];
+    const int joff = ao_loc[jsh];
+
+    for (int a = 0; a < 3; a++){
+        transform_omega_lop(omegaj_a, omegaj, omegaj_rows, LC, a);
+        __syncthreads();
+
+        double reg_gctr[nreg];
+        for (int r = 0; r < nreg; r++){
+            reg_gctr[r] = 0.0;
+        }
+
+        for (int m = 0; m < LCC1; m++){
+            type2_ang<LI, LC>(angi, rca, omegai   + m);
+            type2_ang<LJ, LC>(angj, rcb, omegaj_a + m);
+            __syncthreads();
+
+            for (int ij = threadIdx.x; ij < nfi*nfj; ij += blockDim.x){
+                const int i = ij % nfi;
+                const int j = ij / nfi;
+                double s = 0.0;
+                for (int k = 0; k <= LI; k++){
+                for (int l = 0; l <= LJ; l++){
+                    const double *pangi = angi + k*nfi*LIC1 + i*LIC1;
+                    const double *pangj = angj + l*nfj*LJC1 + j*LJC1;
+                    const double *prad  = rad_all + (k+l)*LIC1*LJC1;
+                    for (int p = (LC + k) & 1; p <= k + LC; p += 2){
+                        const double aip = pangi[p];
+                        const double *prad_p = prad + p*LJC1;
+                        for (int q = (LC + l) & 1; q <= l + LC; q += 2){
+                            s += prad_p[q] * aip * pangj[q];
+                        }
+                    }
+                }}
+                reg_gctr[ij/THREADS] += fac * s;
+            }
+            __syncthreads();
+        }
+
         double *g = gctr + (size_t)a * nao * nao;
         for (int ij = threadIdx.x; ij < nfi*nfj; ij += blockDim.x){
             const int i = ij % nfi;
